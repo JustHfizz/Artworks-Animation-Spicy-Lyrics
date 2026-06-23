@@ -1,6 +1,9 @@
 // ============================================================
-//  animart-proxy.js  —  Animated Artwork Proxy Server v2
-//  Usage: node animart-proxy.js [360|480|720|1080|best]
+//  animart-proxy.js  —  Animated Artwork Proxy Server v3
+//  Optimasi: pre-transcode warm-up + direct pipe segment→ffmpeg
+//            + MSE-ready chunked streaming
+//
+//  Usage: node animart-proxy.js [720|1080|best]
 //
 //  Endpoints:
 //    GET /artwork?artist=&album=&title=  → { m3u8: "..." | null }
@@ -11,17 +14,16 @@
 //  Requires: Node.js + ffmpeg in PATH
 // ============================================================
 
-const http     = require("http");
-const https    = require("https");
+const http      = require("http");
+const https     = require("https");
 const { spawn } = require("child_process");
-const readline = require("readline");
+const readline  = require("readline");
+const { PassThrough } = require("stream");
 
 const PORT = 7799;
 
 const RESOLUTION_OPTIONS = {
-  "360" : { label: "360p  — small size, high bitrate",    height: 360,  bitrate: "0" },
-  "480" : { label: "480p  — standard (default)",          height: 480,  bitrate: "0" },
-  "720" : { label: "720p  — HD",                          height: 720,  bitrate: "0" },
+  "720" : { label: "720p  — HD (default)",               height: 720,  bitrate: "0" },
   "1080": { label: "1080p — Full HD, max quality",        height: 1080, bitrate: "0" },
   "best": { label: "Best  — highest quality (auto res)",  height: null, bitrate: "0" },
 };
@@ -40,7 +42,7 @@ async function pickResolution() {
   if (arg) console.warn(`\n⚠  Unknown resolution "${arg}". Showing menu.\n`);
 
   console.log("\n╔══════════════════════════════════════════════════╗");
-  console.log("║   animart-proxy v2 — Select Resolution           ║");
+  console.log("║   animart-proxy v3 — Select Resolution           ║");
   console.log("╠══════════════════════════════════════════════════╣");
   const keys = Object.keys(RESOLUTION_OPTIONS);
   keys.forEach((k, i) => {
@@ -52,10 +54,10 @@ async function pickResolution() {
 
   return new Promise(resolve => {
     const ask = () => {
-      rl.question("\nSelect [1-5] (Enter = 480p default): ", answer => {
+      rl.question("\nSelect [1-3] (Enter = 720p default): ", answer => {
         const trimmed = answer.trim();
         if (trimmed === "") {
-          selectedResolution = RESOLUTION_OPTIONS["480"];
+          selectedResolution = RESOLUTION_OPTIONS["720"];
           console.log(`✓ Using default: ${selectedResolution.label}`);
           rl.close(); resolve(); return;
         }
@@ -97,7 +99,6 @@ function webmCacheSet(key, webmBuf) {
   console.log(`[proxy] webm cache: saved (${(webmBuf.length / 1024).toFixed(0)} KB), entries: ${webmCache.size}`);
 }
 
-// ── In-flight deduplication ────────────────────────────────
 const inFlight = new Map();
 
 // ── HTTP fetch helpers ─────────────────────────────────────
@@ -105,10 +106,15 @@ function isLargeSegment(url) {
   return url.includes("mvod.itunes.apple.com") || url.includes("mzstatic.com");
 }
 
-function fetchBufOnce(targetUrl, extraHeaders = {}) {
+function isHighResSegment(url) {
+  return /[_\-/](?:1080|1440|2160|fhd|uhd|hd1080)/i.test(url);
+}
+
+function fetchBufOnce(targetUrl, extraHeaders = {}, signal) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new Error("aborted"));
     const proto     = targetUrl.startsWith("https") ? https : http;
-    const timeoutMs = isLargeSegment(targetUrl) ? 30000 : 8000;
+    const timeoutMs = isHighResSegment(targetUrl) ? 45000 : isLargeSegment(targetUrl) ? 30000 : 8000;
     const req = proto.get(targetUrl, {
       headers: {
         "User-Agent"     : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -118,13 +124,14 @@ function fetchBufOnce(targetUrl, extraHeaders = {}) {
         ...extraHeaders,
       }
     }, res => {
+      if (signal?.aborted) { req.destroy(); return reject(new Error("aborted")); }
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location)
-        return resolve(fetchBufOnce(res.headers.location, extraHeaders));
+        return resolve(fetchBufOnce(res.headers.location, extraHeaders, signal));
       if (res.statusCode !== 200)
         return reject(new Error(`HTTP ${res.statusCode} → ${targetUrl.slice(0, 80)}`));
       const chunks = [];
-      res.on("data", c => chunks.push(c));
-      res.on("end",  () => resolve(Buffer.concat(chunks)));
+      res.on("data", c => { if (signal?.aborted) { req.destroy(); return; } chunks.push(c); });
+      res.on("end",  () => signal?.aborted ? reject(new Error("aborted")) : resolve(Buffer.concat(chunks)));
       res.on("error", reject);
     });
     req.on("error", reject);
@@ -132,15 +139,18 @@ function fetchBufOnce(targetUrl, extraHeaders = {}) {
       req.destroy();
       reject(new Error(`Timeout (${timeoutMs / 1000}s): ${targetUrl.slice(0, 60)}`));
     });
+    signal?.addEventListener("abort", () => { req.destroy(); reject(new Error("aborted")); }, { once: true });
   });
 }
 
-async function fetchBuf(targetUrl, extraHeaders = {}, maxRetry = 5) {
+async function fetchBuf(targetUrl, extraHeaders = {}, maxRetry = 5, signal) {
   let lastErr;
   for (let attempt = 1; attempt <= maxRetry; attempt++) {
+    if (signal?.aborted) throw new Error("aborted");
     try {
-      return await fetchBufOnce(targetUrl, extraHeaders);
+      return await fetchBufOnce(targetUrl, extraHeaders, signal);
     } catch (e) {
+      if (signal?.aborted) throw new Error("aborted");
       lastErr = e;
       const retryable = e.code === "ECONNRESET" || e.code === "ECONNREFUSED" ||
                         e.code === "ETIMEDOUT"   || e.message.includes("Timeout");
@@ -152,8 +162,42 @@ async function fetchBuf(targetUrl, extraHeaders = {}, maxRetry = 5) {
   throw lastErr;
 }
 
-const fetchText = async (u, h) => (await fetchBuf(u, h)).toString("utf8");
-const fetchJson = async (u, h) => JSON.parse(await fetchText(u, h));
+// ── NEW: fetchStream — ambil segment sebagai Node.js stream (tidak buffer dulu)
+// Dipakai untuk pipe langsung ke ffmpeg stdin
+function fetchStream(targetUrl, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new Error("aborted"));
+    const proto     = targetUrl.startsWith("https") ? https : http;
+    const timeoutMs = isHighResSegment(targetUrl) ? 45000 : isLargeSegment(targetUrl) ? 30000 : 10000;
+    const req = proto.get(targetUrl, {
+      headers: {
+        "User-Agent"     : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept"         : "*/*",
+        "Connection"     : "keep-alive",
+        "Accept-Encoding": "identity",
+      }
+    }, res => {
+      if (signal?.aborted) { req.destroy(); return reject(new Error("aborted")); }
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location)
+        return resolve(fetchStream(res.headers.location, signal));
+      if (res.statusCode !== 200) {
+        req.destroy();
+        return reject(new Error(`HTTP ${res.statusCode} → ${targetUrl.slice(0, 80)}`));
+      }
+      // Resolve dengan response stream langsung
+      signal?.addEventListener("abort", () => { req.destroy(); }, { once: true });
+      resolve(res);
+    });
+    req.on("error", reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      reject(new Error(`Timeout (${timeoutMs / 1000}s): ${targetUrl.slice(0, 60)}`));
+    });
+  });
+}
+
+const fetchText = async (u, h, signal) => (await fetchBuf(u, h, 5, signal)).toString("utf8");
+const fetchJson = async (u, h, signal) => JSON.parse(await fetchText(u, h, signal));
 
 function sanitize(str) {
   if (!str) return "";
@@ -166,7 +210,7 @@ function sanitize(str) {
 }
 
 // ── Source 1: artwork.m8tec.top ───────────────────────────
-async function fromM8tec(artist, album, title) {
+async function fromM8tec(artist, album, title, signal) {
   const attempts = [
     { artist, album, title },
     { artist: sanitize(artist), album: sanitize(album), title: sanitize(title) },
@@ -177,30 +221,38 @@ async function fromM8tec(artist, album, title) {
     const k = `${q.artist}|${q.album}|${q.title}`;
     return seen.has(k) ? false : (seen.add(k), true);
   })) {
+    if (signal?.aborted) return null;
     const params = new URLSearchParams({ artist: q.artist || "", album: q.album || "", title: q.title || "" });
     try {
-      const json = await fetchJson(`${API_M8TEC}?${params}`, { Accept: "application/json" });
+      const json = await fetchJson(`${API_M8TEC}?${params}`, { Accept: "application/json" }, signal);
       const item = Array.isArray(json) ? json[0] : json;
       const m3u8 = item?.m3u8Url || item?.hlsUrl || item?.videoUrl ||
                    item?.url     || item?.hls_url || item?.stream_url ||
                    item?.variants?.[0]?.url || item?.results?.[0]?.m3u8Url || null;
       if (m3u8) { console.log(`[proxy] ✓ API-1 m8tec: "${q.title}"`); return m3u8; }
-    } catch (e) { console.warn(`[proxy] API-1 m8tec failed: ${e.message}`); }
+    } catch (e) {
+      if (signal?.aborted) return null;
+      console.warn(`[proxy] API-1 m8tec failed: ${e.message}`);
+    }
   }
   return null;
 }
 
 // ── Source 2: Apple Music scrape ──────────────────────────
-async function fromAppleScrape(artist, title) {
+async function fromAppleScrape(artist, title, signal) {
   let collectionId = null;
   try {
     const params = new URLSearchParams({
       term: `${sanitize(title)} ${sanitize(artist)}`, media: "music", entity: "song", limit: "3", country: "us"
     });
-    const json = await fetchJson(`${ITUNES_SEARCH}?${params}`);
+    const json = await fetchJson(`${ITUNES_SEARCH}?${params}`, {}, signal);
     collectionId = json.results?.[0]?.collectionId || null;
-  } catch (e) { console.warn(`[proxy] API-2 iTunes search failed: ${e.message}`); }
+  } catch (e) {
+    if (signal?.aborted) return null;
+    console.warn(`[proxy] API-2 iTunes search failed: ${e.message}`);
+  }
   if (!collectionId) return null;
+  if (signal?.aborted) return null;
 
   try {
     const html = await fetchText(`https://music.apple.com/us/album/${collectionId}`, {
@@ -219,21 +271,29 @@ async function fromAppleScrape(artist, title) {
       const m = pattern.exec(html);
       if (m?.[1]) { console.log(`[proxy] ✓ API-2 Apple scrape: "${title}"`); return m[1]; }
     }
-  } catch (e) { console.warn(`[proxy] API-2 scrape failed: ${e.message}`); }
+  } catch (e) {
+    if (signal?.aborted) return null;
+    console.warn(`[proxy] API-2 scrape failed: ${e.message}`);
+  }
   return null;
 }
 
-// ── Race: return first non-null result ─────────────────────
-function raceFirst(promises) {
+// ── Race: return first non-null result, batalkan yang kalah ─
+function raceFirstAbortable(factories) {
   return new Promise(resolve => {
-    let settled = 0, resolved = false;
-    const total = promises.length;
+    const ac      = new AbortController();
+    const signal  = ac.signal;
+    let settled   = 0, resolved = false;
+    const total   = factories.length;
     if (total === 0) { resolve(null); return; }
-    promises.forEach(p => {
-      Promise.resolve(p).then(val => {
+    factories.forEach(factory => {
+      Promise.resolve(factory(signal)).then(val => {
         settled++;
-        if (!resolved && val != null) { resolved = true; resolve(val); }
-        else if (settled === total && !resolved) resolve(null);
+        if (!resolved && val != null) {
+          resolved = true;
+          ac.abort();
+          resolve(val);
+        } else if (settled === total && !resolved) resolve(null);
       }).catch(() => {
         settled++;
         if (settled === total && !resolved) resolve(null);
@@ -254,9 +314,9 @@ async function resolveM3u8(artist, album, title) {
   }
 
   console.log(`[proxy] searching 2 APIs in parallel: "${title}" — ${artist}`);
-  const m3u8 = await raceFirst([
-    fromM8tec(artist, album, title),
-    fromAppleScrape(artist, title),
+  const m3u8 = await raceFirstAbortable([
+    signal => fromM8tec(artist, album, title, signal),
+    signal => fromAppleScrape(artist, title, signal),
   ]);
 
   cache.set(cacheKey, { m3u8: m3u8 || null, ts: Date.now() });
@@ -324,11 +384,8 @@ async function resolveFirstSegments(m3u8Url, maxSegs = 1) {
     .map(l => resolveUrl(l, base));
 
   console.log(`[proxy] ${segs.length} segments found`);
-  if (segs.length > 0) {
-    console.log(`[proxy] seg[0]: ${segs[0].slice(0, 100)}`);
-  } else {
-    console.warn(`[proxy] ⚠ No segments found! Lines: ${lines.slice(0, 10).join(" | ")}`);
-  }
+  if (segs.length > 0) console.log(`[proxy] seg[0]: ${segs[0].slice(0, 100)}`);
+  else console.warn(`[proxy] ⚠ No segments found! Lines: ${lines.slice(0, 10).join(" | ")}`);
 
   return maxSegs > 0 ? segs.slice(0, maxSegs) : segs;
 }
@@ -395,31 +452,123 @@ function buildFfmpegArgs(gpu, height) {
   if (height) args.push("-vf", `scale=-2:${height},format=yuv420p`);
   else        args.push("-vf", "format=yuv420p");
 
-  const isHighRes = !height || height >= 720;
+  const isUltraHigh = !height || height > 720;
+  const isHighRes   = height >= 720;
+
+  const tileColumns  = isUltraHigh ? "6" : (isHighRes ? "5" : "4");
+  const tileRows     = "2";
+  const crf          = isUltraHigh ? "36" : (isHighRes ? "34" : "33");
+
   args.push(
-    "-c:v",           "libvpx-vp9",
-    "-deadline",      "realtime",
-    "-cpu-used",      "8",
-    "-crf",           isHighRes ? "35" : "33",
-    "-b:v",           "0",
-    "-row-mt",        "1",
-    "-tile-columns",  isHighRes ? "6" : "4",
-    "-tile-rows",     "2",
-    "-frame-parallel","1",
-    "-lag-in-frames", "4",
-    "-static-thresh", "0",
-    "-threads",       String(cpuThreads),
+    "-c:v",            "libvpx-vp9",
+    "-deadline",       "realtime",
+    "-cpu-used",       "8",
+    "-crf",            crf,
+    "-b:v",            "0",
+    "-lag-in-frames",  "0",
+    "-row-mt",         "1",
+    "-tile-columns",   tileColumns,
+    "-tile-rows",      tileRows,
+    "-frame-parallel", "1",
+    "-error-resilient","1",
+    "-threads",        String(cpuThreads),
     "-an", "-f", "webm", "pipe:1"
   );
 
   return args;
 }
 
-// ── ffmpeg: stream output directly to HTTP response ────────
-function runFfmpegStream(ffArgs, inputBuf, res) {
+
+function runFfmpegPipeSegment(segUrl, ffArgs, res, req) {
+  return new Promise(async (resolve, reject) => {
+    let aborted = false;
+    const ff    = spawn("ffmpeg", ffArgs);
+    const chunks = [];
+
+    // Jika client disconnect, kill ffmpeg langsung
+    const onClientClose = () => {
+      if (aborted) return;
+      aborted = true;
+      console.log("[proxy] client disconnected — killing ffmpeg");
+      try { ff.kill("SIGKILL"); } catch (_) {}
+      reject(new Error("client disconnected"));
+    };
+    req?.on("close", onClientClose);
+
+    // Header response sebelum ffmpeg mulai (MSE-ready)
+    res.writeHead(200, {
+      "Content-Type"     : "video/webm",
+      "Transfer-Encoding": "chunked",
+      "Cache-Control"    : "no-store",
+      "X-Cache"          : "MISS",
+    });
+
+    ff.stdout.on("data", chunk => {
+      if (aborted) return;
+      chunks.push(chunk);
+      if (!res.writableEnded) res.write(chunk);
+    });
+    ff.stderr.on("data", d => { if (!aborted) process.stderr.write("[ffmpeg] " + d); });
+
+    ff.on("close", code => {
+      req?.off("close", onClientClose);
+      if (!res.writableEnded) res.end();
+      if (aborted) return;
+      if (code === 0 && chunks.length > 0) resolve(Buffer.concat(chunks));
+      else reject(new Error(`ffmpeg exit ${code} (chunks: ${chunks.length})`));
+    });
+
+    ff.on("error", err => {
+      req?.off("close", onClientClose);
+      if (!res.writableEnded) res.end();
+      if (aborted) return;
+      reject(err.code === "ENOENT"
+        ? new Error("ffmpeg not found in PATH. Install: winget install ffmpeg")
+        : err);
+    });
+
+    ff.stdin.on("error", err => {
+      if (err.code !== "EPIPE" && err.code !== "EOF") {
+        // Tidak reject — stdin tutup lebih awal saat segment selesai, ini normal
+      }
+    });
+
+    // Mulai fetch segment dan pipe langsung ke ffmpeg stdin
+    try {
+      const segStream = await fetchStream(segUrl);
+      // Pipe HTTP response stream → ffmpeg stdin
+      segStream.pipe(ff.stdin);
+      segStream.on("error", err => {
+        if (!aborted) {
+          try { ff.kill("SIGKILL"); } catch (_) {}
+          reject(new Error(`Segment fetch error: ${err.message}`));
+        }
+      });
+    } catch (e) {
+      if (!aborted) {
+        try { ff.stdin.end(); ff.kill("SIGKILL"); } catch (_) {}
+        reject(e);
+      }
+    }
+  });
+}
+
+// ── runFfmpegStream: fallback (buffer dulu) ────────────────
+// Dipakai saat in-flight dedup (tidak bisa pipe ulang)
+function runFfmpegStream(ffArgs, inputBuf, res, req) {
   return new Promise((resolve, reject) => {
     const ff     = spawn("ffmpeg", ffArgs);
     const chunks = [];
+    let   aborted = false;
+
+    const onClientClose = () => {
+      if (aborted) return;
+      aborted = true;
+      console.log("[proxy] client disconnected — killing ffmpeg");
+      try { ff.kill("SIGKILL"); } catch (_) {}
+      reject(new Error("client disconnected"));
+    };
+    req?.on("close", onClientClose);
 
     res.writeHead(200, {
       "Content-Type"    : "video/webm",
@@ -429,19 +578,24 @@ function runFfmpegStream(ffArgs, inputBuf, res) {
     });
 
     ff.stdout.on("data", chunk => {
+      if (aborted) return;
       chunks.push(chunk);
       if (!res.writableEnded) res.write(chunk);
     });
-    ff.stderr.on("data", d => process.stderr.write("[ffmpeg] " + d));
+    ff.stderr.on("data", d => { if (!aborted) process.stderr.write("[ffmpeg] " + d); });
 
     ff.on("close", code => {
+      req?.off("close", onClientClose);
       if (!res.writableEnded) res.end();
+      if (aborted) return;
       if (code === 0 && chunks.length > 0) resolve(Buffer.concat(chunks));
       else reject(new Error(`ffmpeg exit ${code} (chunks: ${chunks.length})`));
     });
 
     ff.on("error", err => {
+      req?.off("close", onClientClose);
       if (!res.writableEnded) res.end();
+      if (aborted) return;
       reject(err.code === "ENOENT"
         ? new Error("ffmpeg not found in PATH. Install: winget install ffmpeg")
         : err);
@@ -456,7 +610,7 @@ function runFfmpegStream(ffArgs, inputBuf, res) {
   });
 }
 
-// ── ffmpeg: buffer mode (for in-flight dedup) ──────────────
+// ── runFfmpeg: buffer mode (untuk pre-transcode tanpa HTTP res) ─
 function runFfmpeg(ffArgs, inputBuf) {
   return new Promise((resolve, reject) => {
     const ff     = spawn("ffmpeg", ffArgs);
@@ -485,19 +639,43 @@ function runFfmpeg(ffArgs, inputBuf) {
   });
 }
 
-function transcodeTS(tsBufs, forceNoGpu) {
-  const height = selectedResolution?.height ?? null;
-  const useGpu = forceNoGpu ? null : (gpuDecoder || null);
-  console.log(`[proxy] transcode: decode=${useGpu ? useGpu.label : "CPU"}, encode=VP9`);
+// ── NEW: prewarmTranscode ──────────────────────────────────
+// Dipanggil segera setelah /artwork resolve m3u8.
+// Download + transcode di background → hasil masuk ke webmCache.
+// Saat extension memanggil /transcode, hasilnya sudah ada (cache HIT) atau hampir selesai.
+async function prewarmTranscode(m3u8Url) {
+  // Jika sudah di-cache atau sedang in-flight, tidak perlu ulang
+  const cached = webmCache.get(m3u8Url);
+  if (cached && (Date.now() - cached.ts) < WEBM_CACHE_TTL_MS) {
+    console.log(`[proxy] prewarm: webm cache already warm`);
+    return;
+  }
+  if (inFlight.has(m3u8Url)) {
+    console.log(`[proxy] prewarm: transcode already in-flight`);
+    return;
+  }
 
-  return runFfmpeg(buildFfmpegArgs(useGpu, height), Buffer.concat(tsBufs))
-    .catch(async err => {
-      if (useGpu && !forceNoGpu) {
-        console.warn(`[proxy] ⚠ GPU decode failed: ${err.message} → falling back to CPU`);
-        return transcodeTS(tsBufs, true);
-      }
-      throw new Error(`Transcode failed: ${err.message}`);
-    });
+  console.log(`[proxy] 🔥 prewarm: starting background transcode`);
+
+  const transcodePromise = (async () => {
+    try {
+      const segs = await resolveFirstSegments(m3u8Url, 1);
+      if (segs.length === 0) throw new Error("No segments");
+
+      const tsBuf = await fetchBuf(segs[0], {}, 6);
+      const gpu   = gpuDecoder || null;
+      const webm  = await runFfmpeg(buildFfmpegArgs(gpu, selectedResolution?.height ?? null), tsBuf);
+      webmCacheSet(m3u8Url, webm);
+      console.log(`[proxy] 🔥 prewarm: done (${(webm.length / 1024).toFixed(0)} KB cached)`);
+      return webm;
+    } catch (e) {
+      console.warn(`[proxy] prewarm failed: ${e.message}`);
+      throw e;
+    }
+  })();
+
+  inFlight.set(m3u8Url, transcodePromise);
+  transcodePromise.finally(() => inFlight.delete(m3u8Url));
 }
 
 // ── HTTP Server ────────────────────────────────────────────
@@ -515,7 +693,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       status    : "ok",
-      version   : "v2",
+      version   : "v3",
       resolution: selectedResolution?.label || "original (full quality)",
       decode    : gpuDecoder ? `GPU: ${gpuDecoder.label}` : "CPU only",
       encode    : "libvpx-vp9 (VP9, realtime)",
@@ -530,6 +708,7 @@ const server = http.createServer(async (req, res) => {
     const artist = parsed.searchParams.get("artist") || "";
     const album  = parsed.searchParams.get("album")  || "";
     const title  = parsed.searchParams.get("title")  || "";
+
     if (!artist && !title) {
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Missing artist or title" }));
@@ -539,6 +718,12 @@ const server = http.createServer(async (req, res) => {
       const m3u8 = await resolveM3u8(artist, album, title);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ m3u8: m3u8 || null }));
+
+      // ── NEW: Segera prewarm transcode setelah m3u8 ditemukan ──
+      // Tidak tunggu response /transcode dari extension
+      if (m3u8) {
+        setImmediate(() => prewarmTranscode(m3u8).catch(() => {}));
+      }
     } catch (e) {
       console.error("[proxy] /artwork error:", e.message);
       res.writeHead(500, { "Content-Type": "application/json" });
@@ -558,7 +743,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      // 1. Check WebM cache
+      // 1. WebM cache HIT → kirim langsung (paling cepat, sudah prewarm)
       const cached = webmCache.get(m3u8Url);
       if (cached && (Date.now() - cached.ts) < WEBM_CACHE_TTL_MS) {
         cached.hitCount++;
@@ -574,85 +759,56 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // 2. In-flight dedup
+      // 2. In-flight dedup (prewarm sedang jalan) → tunggu, lalu stream hasilnya
       if (inFlight.has(m3u8Url)) {
-        console.log(`[proxy] duplicate request — waiting for in-flight...`);
+        console.log(`[proxy] ⏳ prewarm in-flight — joining and streaming result`);
         const webm = await inFlight.get(m3u8Url);
         res.writeHead(200, {
           "Content-Type"  : "video/webm",
           "Content-Length": webm.length,
           "Cache-Control" : "no-store",
-          "X-Cache"       : "DEDUP",
+          "X-Cache"       : "PREWARM",
         });
         res.end(webm);
         return;
       }
 
-      // 3. Download + transcode (stream to response)
-      console.log(`[proxy] transcode: ${m3u8Url.slice(0, 80)}...`);
+      // 3. Cold start: pipe segment langsung ke ffmpeg (tidak buffer seluruh segment)
+      console.log(`[proxy] ❄ cold transcode (pipe): ${m3u8Url.slice(0, 80)}...`);
+      const t0 = Date.now();
 
-      const transcodePromise = (async () => {
-        const t0 = Date.now();
-
-        let segs = null;
-        for (let attempt = 1; attempt <= 6; attempt++) {
-          try {
-            segs = await resolveFirstSegments(m3u8Url, 1);
-            break;
-          } catch (e) {
-            const retryable = e.message.includes("ECONNRESET") || e.message.includes("Timeout") ||
-                              e.message.includes("ECONNREFUSED");
-            if (!retryable || attempt === 6) throw e;
-            console.warn(`[proxy] playlist retry ${attempt}/5 (${e.message.slice(0, 50)})`);
-            await new Promise(r => setTimeout(r, 100 + attempt * 50));
-          }
+      let segs;
+      for (let attempt = 1; attempt <= 6; attempt++) {
+        try { segs = await resolveFirstSegments(m3u8Url, 1); break; }
+        catch (e) {
+          const retryable = e.message.includes("ECONNRESET") || e.message.includes("Timeout") ||
+                            e.message.includes("ECONNREFUSED");
+          if (!retryable || attempt === 6) throw e;
+          console.warn(`[proxy] playlist retry ${attempt}/5 (${e.message.slice(0, 50)})`);
+          await new Promise(r => setTimeout(r, 80 + attempt * 40));
         }
+      }
+      if (!segs || segs.length === 0) throw new Error("No segments found in playlist");
 
-        console.log(`[proxy] ${segs.length} segment(s) (resolve: ${Date.now() - t0}ms)`);
-        if (segs.length === 0) throw new Error("No segments found in playlist");
+      console.log(`[proxy] playlist resolve: ${Date.now() - t0}ms — piping segment directly to ffmpeg`);
 
-        const t1 = Date.now();
-        console.log(`[proxy] downloading ${segs.length} segment(s)...`);
-        const tsBufs = await Promise.all(
-          segs.map((seg, i) =>
-            fetchBuf(seg, {}, 6).then(buf => {
-              process.stdout.write(`[proxy] seg ${i + 1}/${segs.length} ✓ ${(buf.length / 1024).toFixed(0)}KB\n`);
-              return buf;
-            })
-          )
-        );
+      const gpu   = gpuDecoder || null;
+      const ffArgs = buildFfmpegArgs(gpu, selectedResolution?.height ?? null);
 
-        const totalBytes = tsBufs.reduce((s, b) => s + b.length, 0);
-        console.log(`[proxy] download done: ${(totalBytes / 1024).toFixed(0)} KB (${Date.now() - t1}ms)`);
-        if (totalBytes === 0) throw new Error("All segments empty (0 bytes)");
-
-        const t2   = Date.now();
-        const gpu  = gpuDecoder || null;
-        console.log(`[proxy] transcode H.264 → WebM VP9 (streaming), decode=${gpu ? gpu.label : "CPU"}`);
-
-        let webm;
-        try {
-          webm = await runFfmpegStream(buildFfmpegArgs(gpu, selectedResolution?.height ?? null), Buffer.concat(tsBufs), res);
-        } catch (err) {
-          if (gpu) console.warn(`[proxy] ⚠ GPU decode failed (stream): ${err.message}`);
-          throw err;
-        }
-
-        console.log(`[proxy] transcode done: ${(webm.length / 1024).toFixed(0)} KB (${Date.now() - t2}ms)`);
-        console.log(`[proxy] total: ${Date.now() - t0}ms`);
-        return webm;
-      })();
+      // ── Pipe segment stream langsung ke ffmpeg (tidak tunggu download selesai)
+      const transcodePromise = runFfmpegPipeSegment(segs[0], ffArgs, res, req)
+        .then(webm => {
+          console.log(`[proxy] ✓ cold transcode done: ${(webm.length / 1024).toFixed(0)} KB (${Date.now() - t0}ms total)`);
+          webmCacheSet(m3u8Url, webm);
+          return webm;
+        });
 
       inFlight.set(m3u8Url, transcodePromise);
-      let webm;
       try {
-        webm = await transcodePromise;
+        await transcodePromise;
       } finally {
         inFlight.delete(m3u8Url);
       }
-
-      webmCacheSet(m3u8Url, webm);
-      // Response already sent via runFfmpegStream
       return;
 
     } catch (e) {
@@ -696,10 +852,13 @@ const server = http.createServer(async (req, res) => {
 
   server.listen(PORT, "127.0.0.1", () => {
     const decodeMode = gpuDecoder ? `GPU (${gpuDecoder.label})` : "CPU only";
-    console.log(`\n✅ animart-proxy v2 running at http://localhost:${PORT}`);
-    console.log(`   Resolution : ${selectedResolution?.label || "480p default"}`);
+    console.log(`\n✅ animart-proxy v3 running at http://localhost:${PORT}`);
+    console.log(`   Resolution : ${selectedResolution?.label || "720p default"}`);
     console.log(`   Encoder    : VP9 (libvpx-vp9)`);
     console.log(`   Decode     : ${decodeMode}`);
+    console.log(`   Segments   : 1 (hemat kuota)`);
+    console.log(`   Pipe mode  : segment → ffmpeg direct (no buffer wait)`);
+    console.log(`   Pre-warm   : ✓ transcode starts immediately after /artwork resolves`);
     console.log(`   Health     : http://localhost:${PORT}/ping`);
     console.log(`   Artwork    : http://localhost:${PORT}/artwork?artist=Drake&title=Nokia`);
     console.log(`   Transcode  : http://localhost:${PORT}/transcode?url=<m3u8_url>`);
@@ -707,7 +866,8 @@ const server = http.createServer(async (req, res) => {
     console.log(`   API-1: artwork.m8tec.top`);
     console.log(`   API-2: iTunes Search + Apple Music scrape`);
     console.log(`\n🗃  WebM Cache: max ${WEBM_CACHE_MAX} tracks, TTL 2h`);
-    console.log(`💡 Tip: node animart-proxy.js 720  → use 720p directly`);
+    console.log(`⚡ v3 optimizations: prewarm + direct pipe + MSE streaming`);
+    console.log(`💡 Tip: node animart-proxy.js 1080  → use 1080p directly`);
     console.log(`⚠  Requires ffmpeg: winget install ffmpeg\n`);
   });
 
