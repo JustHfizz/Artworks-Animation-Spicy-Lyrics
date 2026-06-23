@@ -5,7 +5,13 @@ A Spicetify extension that brings your album artwork to life with smooth animati
 ---
 
 
-https://github.com/user-attachments/assets/c942f09d-d64a-4689-ad85-403b492950da
+
+
+https://github.com/user-attachments/assets/2f0fd20f-8618-49c8-95a2-e5d663bf49c4
+
+https://github.com/user-attachments/assets/4ce8f09e-244a-4892-bbbc-2b0afda63bba
+
+
 
 
 
