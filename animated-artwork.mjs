@@ -654,26 +654,23 @@
       btn.title = "Local Artwork";
       btn.innerHTML = this._iconSVG(20);
 
-      // Tentukan border-radius tombol mengikuti TEMA YANG SEDANG AKTIF, bukan
-      // sekadar meniru tombol referensi (yang kadang tidak akurat / kebetulan
-      // bulat). Pakai detektor radius yang sama dengan yang dipakai panel
-      // (_getThemeColors → baca radius asli dari popup/menu Liquify yang
-      // sedang dirender, atau variabel --spice-border-radius /
-      // --liquify-border-radius). Hasilnya di-skalakan turun supaya pas untuk
-      // tombol ikon kecil, mirip skala yang dipakai tombol upload di panel
-      // (lihat _buildPanel: calc(var(--animart-radius) * 0.55/0.65)).
-      let themeRadiusPx = 12; // fallback netral kalau semua deteksi gagal
-      try {
-        const { panelRadius } = this._getThemeColors();
-        const m = String(panelRadius).match(/[\d.]+/);
-        if (m) themeRadiusPx = parseFloat(m[0]);
-      } catch (_) {}
-      // Kalau tombol referensi memang bulat sempurna (50%) DAN tema tidak
-      // memberi info radius yang masuk akal, baru fallback ke bulat.
-      const refRadius = s.borderRadius || "";
-      const btnRadius = refRadius && refRadius !== "50%" && refRadius !== "0px"
-        ? refRadius
-        : `${Math.max(8, Math.round(themeRadiusPx * 0.6))}px`;
+      // Tentukan border-radius tombol berbasis PROPORSI UKURAN TOMBOL ITU
+      // SENDIRI (gaya "squircle" — kotak membulat), BUKAN dari hasil
+      // deteksi/clone tombol referensi yang ternyata tidak bisa diandalkan
+      // di tema Liquify (kadang ikut menangkap radius 50% / elemen lain yang
+      // kebetulan bulat). Ini meniru gaya ikon top bar Liquify (panah, cart)
+      // yang berbentuk kotak membulat — bukan pill (seperti chip "All /
+      // Music / Podcasts") dan bukan lingkaran penuh.
+      const parsePx = (val, fallback) => {
+        const m = String(val || "").match(/[\d.]+/);
+        return m ? parseFloat(m[0]) : fallback;
+      };
+      const btnWidthPx  = parsePx(s.width, 36);
+      const btnHeightPx = parsePx(s.height, 36);
+      const baseSizePx  = Math.min(btnWidthPx, btnHeightPx) || 36;
+      // ~32% dari sisi terpendek = squircle yang jelas bersudut membulat,
+      // jauh dari 50% (lingkaran penuh).
+      const btnRadius = `${Math.max(8, Math.round(baseSizePx * 0.32))}px`;
 
       // Mirror exact computed dimensions from reference button, then apply Liquify glass style
       Object.assign(btn.style, {
