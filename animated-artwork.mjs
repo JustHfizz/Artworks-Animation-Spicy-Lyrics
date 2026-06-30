@@ -654,6 +654,27 @@
       btn.title = "Local Artwork";
       btn.innerHTML = this._iconSVG(20);
 
+      // Tentukan border-radius tombol mengikuti TEMA YANG SEDANG AKTIF, bukan
+      // sekadar meniru tombol referensi (yang kadang tidak akurat / kebetulan
+      // bulat). Pakai detektor radius yang sama dengan yang dipakai panel
+      // (_getThemeColors → baca radius asli dari popup/menu Liquify yang
+      // sedang dirender, atau variabel --spice-border-radius /
+      // --liquify-border-radius). Hasilnya di-skalakan turun supaya pas untuk
+      // tombol ikon kecil, mirip skala yang dipakai tombol upload di panel
+      // (lihat _buildPanel: calc(var(--animart-radius) * 0.55/0.65)).
+      let themeRadiusPx = 12; // fallback netral kalau semua deteksi gagal
+      try {
+        const { panelRadius } = this._getThemeColors();
+        const m = String(panelRadius).match(/[\d.]+/);
+        if (m) themeRadiusPx = parseFloat(m[0]);
+      } catch (_) {}
+      // Kalau tombol referensi memang bulat sempurna (50%) DAN tema tidak
+      // memberi info radius yang masuk akal, baru fallback ke bulat.
+      const refRadius = s.borderRadius || "";
+      const btnRadius = refRadius && refRadius !== "50%" && refRadius !== "0px"
+        ? refRadius
+        : `${Math.max(8, Math.round(themeRadiusPx * 0.6))}px`;
+
       // Mirror exact computed dimensions from reference button, then apply Liquify glass style
       Object.assign(btn.style, {
         display:             "inline-flex",
@@ -662,10 +683,7 @@
         width:               s.width,
         height:              s.height,
         minWidth:            s.minWidth,
-        // Ikuti border-radius tombol referensi (icon bar) dari tema yang sedang
-        // aktif saat ini — bukan dipaksa bulat (50%) seperti sebelumnya.
-        // Fallback ke "50%" hanya kalau tema tidak mendefinisikan radius sama sekali.
-        borderRadius:        (s.borderRadius && s.borderRadius !== "0px") ? s.borderRadius : "50%",
+        borderRadius:        btnRadius,
         // Glass background matching Liquify's frosted glass aesthetic
         background:          "rgba(255,255,255,0.07)",
         border:              "1px solid rgba(255,255,255,0.12)",
