@@ -662,8 +662,10 @@
         width:               s.width,
         height:              s.height,
         minWidth:            s.minWidth,
-        // Liquify uses heavily rounded corners — override to match its pill/circle buttons
-        borderRadius:        "50%",
+        // Ikuti border-radius tombol referensi (icon bar) dari tema yang sedang
+        // aktif saat ini — bukan dipaksa bulat (50%) seperti sebelumnya.
+        // Fallback ke "50%" hanya kalau tema tidak mendefinisikan radius sama sekali.
+        borderRadius:        (s.borderRadius && s.borderRadius !== "0px") ? s.borderRadius : "50%",
         // Glass background matching Liquify's frosted glass aesthetic
         background:          "rgba(255,255,255,0.07)",
         border:              "1px solid rgba(255,255,255,0.12)",
