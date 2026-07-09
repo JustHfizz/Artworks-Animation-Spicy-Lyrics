@@ -1,16 +1,3 @@
-// ============================================================
-//  animart-proxy.js — Animated Artwork Proxy Server v3
-//
-//  Usage: node animart-proxy.js [720|1080|best]
-//
-//  Endpoints:
-//    GET /artwork?artist=&album=&title=  → { m3u8: "..." | null }
-//    GET /transcode?url=<m3u8>           → video/webm (streamed)
-//    GET /ping                           → status JSON
-//    GET /cache/clear                    → clear all caches
-//
-//  Requires: Node.js + ffmpeg in PATH
-// ============================================================
 
 const http      = require("http");
 const https     = require("https");
@@ -26,8 +13,157 @@ const GITHUB_API_REPO   = "https://api.github.com/repos/JustHfizz/Artworks-Anima
 const SCRIPT_DIR        = __dirname;
 const PROXY_FILENAME    = "animart-proxy.js";
 const EXT_FILENAME      = "animated-artwork.mjs";
+const CONFIG_PATH       = path.join(SCRIPT_DIR, "animart-config.json");
 
-// djb2 hash — must match the implementation in the extension
+
+
+
+const DEBUG = process.argv.includes("--debug") || process.env.ANIMART_DEBUG === "1";
+function dlog(...args)  { if (DEBUG) console.log(...args); }
+function dwarn(...args) { if (DEBUG) console.warn(...args); }
+
+
+
+
+
+const BAR_WIDTH = 22;
+function drawBar(pct) {
+  const p      = Math.max(0, Math.min(100, Math.round(pct || 0)));
+  const filled = Math.round((p / 100) * BAR_WIDTH);
+  return `[${"█".repeat(filled)}${"░".repeat(BAR_WIDTH - filled)}] ${String(p).padStart(3)}%`;
+}
+
+const STATUS_LABEL = {
+  searching : "searching source…",
+  found     : "source found",
+  notfound  : "not found",
+  ready     : "ready",
+  failed    : "failed",
+};
+
+class TrackBoard {
+  constructor() {
+    this.tracks       = new Map();  
+    this.order        = [];
+    this.linesPrinted = 0;
+    this.seq          = 0;
+    this.enabled      = process.stdout.isTTY === true;
+    this._renderTimer = null;
+  }
+
+  add(artist, title, album) {
+    const id = `t${++this.seq}`;
+    this.tracks.set(id, {
+      artist: artist || "Unknown Artist",
+      title : title  || "Unknown Title",
+      album : album  || "-",
+      source: null,
+      status: "searching",
+      downloadPct : 0,
+      transcodePct: 0,
+      note: "",
+    });
+    this.order.push(id);
+    this._trim();
+    this.render();
+    return id;
+  }
+
+  update(id, patch) {
+    if (!id) return;
+    const t = this.tracks.get(id);
+    if (!t) return;
+    Object.assign(t, patch);
+    this._scheduleRender();
+  }
+
+  finish(id, ok, note) {
+    if (!id) return;
+    const t = this.tracks.get(id);
+    if (!t) return;
+    t.status = ok ? "ready" : "failed";
+    if (note) t.note = note;
+    if (ok) { t.downloadPct = 100; t.transcodePct = 100; }
+    this.render();
+  }
+
+  _trim() {
+    const MAX_ROWS = 6;
+    while (this.order.length > MAX_ROWS) {
+      const oldest = this.order.shift();
+      this.tracks.delete(oldest);
+    }
+  }
+
+  _lines() {
+    const W = 64;
+    const rule = "─".repeat(W);
+    const lines = [rule, "🎵  ANIMART PROXY — Now Playing / Queue", rule];
+    if (this.order.length === 0) {
+      lines.push("   (waiting for a song...)");
+    }
+    for (const id of this.order) {
+      const t = this.tracks.get(id);
+      if (!t) continue;
+      const src = t.source ? t.source : STATUS_LABEL[t.status] || "";
+      const tail = t.status === "notfound" || t.status === "failed"
+        ? `  ✗ ${t.note || STATUS_LABEL[t.status]}`
+        : t.status === "ready" ? "  ✓ cached" : "";
+      lines.push(`Song      : ${t.title}`);
+      lines.push(`Album     : ${t.album}`);
+      lines.push(`Artist    : ${t.artist}`);
+      lines.push(`Source    : ${src}${tail}`);
+      lines.push(`Download  : ${drawBar(t.downloadPct)}`);
+      lines.push(`Transcode : ${drawBar(t.transcodePct)}`);
+      lines.push("");
+    }
+    lines.push(rule);
+    return lines;
+  }
+
+  // Rate-limit redraws during rapid progress events (download/transcode fire
+  // many times a second) so the console isn't hammered with writes.
+  _scheduleRender() {
+    if (!this.enabled || this._renderTimer) return;
+    this._renderTimer = setTimeout(() => {
+      this._renderTimer = null;
+      this.render();
+    }, 120);
+  }
+
+  pause() {
+    if (this._renderTimer) { clearTimeout(this._renderTimer); this._renderTimer = null; }
+    if (!this.enabled || this.linesPrinted === 0) return;
+    readline.moveCursor(process.stdout, 0, -this.linesPrinted);
+    readline.clearScreenDown(process.stdout);
+    this.linesPrinted = 0;
+  }
+
+  render() {
+    if (!this.enabled) return;
+    if (this._renderTimer) { clearTimeout(this._renderTimer); this._renderTimer = null; }
+    const lines = this._lines();
+    if (this.linesPrinted > 0) {
+      readline.moveCursor(process.stdout, 0, -this.linesPrinted);
+      readline.clearScreenDown(process.stdout);
+    }
+    process.stdout.write(lines.join("\n") + "\n");
+    this.linesPrinted = lines.length;
+  }
+}
+
+const board       = new TrackBoard();
+const m3u8ToTrack = new Map(); 
+
+function loadConfig() {
+  try {
+    if (fs.existsSync(CONFIG_PATH)) return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+  } catch (e) {
+    console.warn(`[config] could not read ${CONFIG_PATH}: ${e.message}`);
+  }
+  return {};
+}
+
 function djb2(str) {
   let h = 5381;
   for (let i = 0; i < str.length; i++) h = ((h << 5) + h) ^ str.charCodeAt(i);
@@ -92,7 +228,6 @@ async function checkFileUpdate(filename) {
     const commitSha    = latestCommit.sha?.slice(0, 7) || "?";
     const commitMsg    = latestCommit.commit?.message?.split("\n")[0] || "";
 
-    // Compare actual content, not just mtime
     const rawUrl = `${GITHUB_RAW_BASE}/${filename}`;
     const { status: rawStatus, body: remoteCode } = await fetchGitHub(rawUrl);
     if (rawStatus !== 200 || !remoteCode) return { hasUpdate: false };
@@ -135,14 +270,16 @@ async function runStartupUpdateCheck() {
   console.log("║             Animation-Spicy-Lyrics                   ║");
   console.log("║   2. Replace the old file with the new one           ║");
   console.log("║   3. Restart: node animart-proxy.js                  ║");
-  console.log("╠══════════════════════════════════════════════════════╣");
+  console.log("╚══════════════════════════════════════════════════════╝\n");
+
+  console.log("╔══════════════════════════════════════════════════════╗");
   console.log("║  [Enter] Continue without updating   [Q] Quit        ║");
   console.log("╚══════════════════════════════════════════════════════╝\n");
 
   const answer = await new Promise(resolve => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     rl.question("Your choice [Enter/Q]: ", ans => { rl.close(); resolve(ans.trim().toLowerCase()); });
-    // 30s timeout → auto-continue for headless/non-interactive runs
+
     setTimeout(() => { rl.close(); resolve(""); }, 30000);
   });
 
@@ -156,7 +293,6 @@ async function runStartupUpdateCheck() {
   console.log("\n▶ Continuing with the current version...\n");
 }
 
-// ── Multipart parser (no external dependency) ──────────────
 function parseMultipart(body, boundary) {
   const parts = [];
   const sep   = Buffer.from("--" + boundary);
@@ -202,18 +338,32 @@ const RESOLUTION_OPTIONS = {
   "best": { label: "Best  — highest quality (auto res)",  height: null, bitrate: "0" },
 };
 
+const BEST_MODE_MAX_HEIGHT = 1600;
+
+function buildScaleFilter(targetHeight) {
+  const h = targetHeight ?? BEST_MODE_MAX_HEIGHT;
+
+  return `scale=-2:min(ih\\,${h}),format=yuv420p`;
+}
+
 let selectedResolution = null;
 
 async function pickResolution() {
-  const arg = process.argv[2]?.toLowerCase()?.trim();
+  const arg    = process.argv[2]?.toLowerCase()?.trim();
+  const config = loadConfig();
 
   if (arg && RESOLUTION_OPTIONS[arg]) {
     selectedResolution = RESOLUTION_OPTIONS[arg];
     console.log(`\n🎬 Resolution: ${selectedResolution.label}`);
     return;
   }
+  if (arg) console.warn(`\n⚠  Unknown resolution "${arg}".`);
 
-  if (arg) console.warn(`\n⚠  Unknown resolution "${arg}". Showing menu.\n`);
+  if (config.resolution && RESOLUTION_OPTIONS[config.resolution]) {
+    selectedResolution = RESOLUTION_OPTIONS[config.resolution];
+    console.log(`\n🎬 Resolution (saved): ${selectedResolution.label}`);
+    return;
+  }
 
   console.log("\n╔══════════════════════════════════════════════════╗");
   console.log("║   animart-proxy v3 — Select Resolution           ║");
@@ -250,16 +400,13 @@ async function pickResolution() {
   });
 }
 
-// ── API sources ────────────────────────────────────────────
 const API_M8TEC     = "https://artwork.m8tec.top/api/v1/artwork/search";
 const ITUNES_SEARCH = "https://itunes.apple.com/search";
 
-// ── m3u8 URL cache ─────────────────────────────────────────
 const cache          = new Map();
 const CACHE_TTL_MS   = 24 * 60 * 60 * 1000;
 const CACHE_NONE_MS  =  4 * 60 * 60 * 1000;
 
-// ── WebM cache ─────────────────────────────────────────────
 const webmCache         = new Map();
 const WEBM_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const WEBM_CACHE_MAX    = 10;
@@ -267,17 +414,14 @@ const WEBM_CACHE_MAX    = 10;
 function webmCacheSet(key, webmBuf) {
   if (webmCache.size >= WEBM_CACHE_MAX) {
     webmCache.delete(webmCache.keys().next().value);
-    console.log(`[proxy] webm cache full — evicted oldest entry`);
+    dlog(`[proxy] webm cache full — evicted oldest entry`);
   }
   webmCache.set(key, { webm: webmBuf, ts: Date.now(), hitCount: 0 });
-  console.log(`[proxy] webm cache: saved (${(webmBuf.length / 1024).toFixed(0)} KB), entries: ${webmCache.size}`);
+  dlog(`[proxy] webm cache: saved (${(webmBuf.length / 1024).toFixed(0)} KB), entries: ${webmCache.size}`);
 }
 
-// ── In-flight deduplication ────────────────────────────────
-// Stores Promise<Buffer> so it can be reused by both prewarm and the HTTP client
 const inFlight = new Map();
 
-// ── HTTP fetch helpers ─────────────────────────────────────
 function isLargeSegment(url) {
   return url.includes("mvod.itunes.apple.com") || url.includes("mzstatic.com");
 }
@@ -331,15 +475,13 @@ async function fetchBuf(targetUrl, extraHeaders = {}, maxRetry = 5, signal) {
       const retryable = e.code === "ECONNRESET" || e.code === "ECONNREFUSED" ||
                         e.code === "ETIMEDOUT"   || e.message.includes("Timeout");
       if (!retryable || attempt === maxRetry) break;
-      console.warn(`[proxy] retry ${attempt}/${maxRetry - 1} (${e.code || e.message.slice(0, 30)}): ${targetUrl.slice(0, 60)}`);
-      await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt - 1))); // exponential: 500ms, 1s, 2s, 4s
+      dwarn(`[proxy] retry ${attempt}/${maxRetry - 1} (${e.code || e.message.slice(0, 30)}): ${targetUrl.slice(0, 60)}`);
+      await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt - 1)));
     }
   }
   throw lastErr;
 }
 
-// fetchStream — gets a segment as a Node.js stream (no buffering), used to
-// pipe directly into ffmpeg's stdin.
 function fetchStream(targetUrl, signal) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(new Error("aborted"));
@@ -374,6 +516,23 @@ function fetchStream(targetUrl, signal) {
 const fetchText = async (u, h, signal) => (await fetchBuf(u, h, 5, signal)).toString("utf8");
 const fetchJson = async (u, h, signal) => JSON.parse(await fetchText(u, h, signal));
 
+
+async function fetchBufWithProgress(targetUrl, extraHeaders = {}, onProgress) {
+  const stream = await fetchStream(targetUrl);
+  const total  = parseInt(stream.headers?.["content-length"] || "0", 10);
+  let received = 0;
+  const chunks = [];
+  return new Promise((resolve, reject) => {
+    stream.on("data", chunk => {
+      chunks.push(chunk);
+      received += chunk.length;
+      if (onProgress) onProgress(total > 0 ? Math.min(99, (received / total) * 100) : 0);
+    });
+    stream.on("end", () => { if (onProgress) onProgress(100); resolve(Buffer.concat(chunks)); });
+    stream.on("error", reject);
+  });
+}
+
 function sanitize(str) {
   if (!str) return "";
   return str
@@ -384,7 +543,6 @@ function sanitize(str) {
     .trim();
 }
 
-// ── Source 1: artwork.m8tec.top ───────────────────────────
 async function fromM8tec(artist, album, title, signal) {
   const attempts = [
     { artist, album, title },
@@ -404,16 +562,15 @@ async function fromM8tec(artist, album, title, signal) {
       const m3u8 = item?.m3u8Url || item?.hlsUrl || item?.videoUrl ||
                    item?.url     || item?.hls_url || item?.stream_url ||
                    item?.variants?.[0]?.url || item?.results?.[0]?.m3u8Url || null;
-      if (m3u8) { console.log(`[proxy] ✓ API-1 m8tec: "${q.title}"`); return m3u8; }
+      if (m3u8) { dlog(`[proxy] ✓ API-1 m8tec: "${q.title}"`); return m3u8; }
     } catch (e) {
       if (signal?.aborted) return null;
-      console.warn(`[proxy] API-1 m8tec failed: ${e.message}`);
+      dwarn(`[proxy] API-1 m8tec failed: ${e.message}`);
     }
   }
   return null;
 }
 
-// ── Source 2: Apple Music scrape ──────────────────────────
 async function fromAppleScrape(artist, title, signal) {
   let collectionId = null;
   try {
@@ -424,7 +581,7 @@ async function fromAppleScrape(artist, title, signal) {
     collectionId = json.results?.[0]?.collectionId || null;
   } catch (e) {
     if (signal?.aborted) return null;
-    console.warn(`[proxy] API-2 iTunes search failed: ${e.message}`);
+    dwarn(`[proxy] API-2 iTunes search failed: ${e.message}`);
   }
   if (!collectionId) return null;
   if (signal?.aborted) return null;
@@ -444,17 +601,15 @@ async function fromAppleScrape(artist, title, signal) {
     ];
     for (const pattern of patterns) {
       const m = pattern.exec(html);
-      if (m?.[1]) { console.log(`[proxy] ✓ API-2 Apple scrape: "${title}"`); return m[1]; }
+      if (m?.[1]) { dlog(`[proxy] ✓ API-2 Apple scrape: "${title}"`); return m[1]; }
     }
   } catch (e) {
     if (signal?.aborted) return null;
-    console.warn(`[proxy] API-2 scrape failed: ${e.message}`);
+    dwarn(`[proxy] API-2 scrape failed: ${e.message}`);
   }
   return null;
 }
 
-// Race: return the first non-null result, abort the losers.
-// Returns { m3u8, source } where source is the label of the winning factory.
 function raceFirstAbortable(factories) {
   return new Promise(resolve => {
     const ac      = new AbortController();
@@ -478,29 +633,33 @@ function raceFirstAbortable(factories) {
   });
 }
 
-async function resolveM3u8(artist, album, title) {
+async function resolveM3u8(artist, album, title, boardId) {
   const cacheKey = `${sanitize(artist)}|${sanitize(album)}|${sanitize(title)}`;
   const cached   = cache.get(cacheKey);
   if (cached) {
     const age = Date.now() - cached.ts;
     if (age < (cached.m3u8 ? CACHE_TTL_MS : CACHE_NONE_MS)) {
-      console.log(`[proxy] cache hit: "${title}" → ${cached.m3u8 ? "✓" : "none"} (${cached.source || "?"})`);
+      dlog(`[proxy] cache hit: "${title}" → ${cached.m3u8 ? "✓" : "none"} (${cached.source || "?"})`);
+      board.update(boardId, {
+        source: cached.source ? `${cached.source} (cache)` : "cache",
+        status: cached.m3u8 ? "found" : "notfound",
+      });
       return { m3u8: cached.m3u8 || null, source: cached.source || null };
     }
   }
 
-  console.log(`[proxy] searching 2 APIs in parallel: "${title}" — ${artist}`);
+  dlog(`[proxy] searching 2 APIs in parallel: "${title}" — ${artist}`);
   const { m3u8, source } = await raceFirstAbortable([
     { label: "m8tec",  fn: signal => fromM8tec(artist, album, title, signal) },
     { label: "apple",  fn: signal => fromAppleScrape(artist, title, signal)  },
   ]);
 
   cache.set(cacheKey, { m3u8: m3u8 || null, source: source || null, ts: Date.now() });
-  console.log(m3u8 ? `[proxy] ✓ resolved: "${title}" via ${source}` : `[proxy] ✗ no artwork: "${title}"`);
+  dlog(m3u8 ? `[proxy] ✓ resolved: "${title}" via ${source}` : `[proxy] ✗ no artwork: "${title}"`);
+  board.update(boardId, { source: source || null, status: m3u8 ? "found" : "notfound" });
   return { m3u8: m3u8 || null, source: source || null };
 }
 
-// ── M3U8 playlist parsing ──────────────────────────────────
 const resolveBase = url => url.substring(0, url.lastIndexOf("/") + 1);
 
 function resolveUrl(rawUrl, baseUrl) {
@@ -517,7 +676,7 @@ async function resolveFirstSegments(m3u8Url, maxSegs = 1) {
     throw new Error(`Failed to fetch playlist: ${e.message} → ${m3u8Url.slice(0, 80)}`);
   }
 
-  console.log(`[proxy] playlist preview: ${text.split("\n").slice(0, 8).join(" | ").slice(0, 200)}`);
+  dlog(`[proxy] playlist preview: ${text.split("\n").slice(0, 8).join(" | ").slice(0, 200)}`);
   const lines = text.split("\n").map(l => l.trim()).filter(l => l.length > 0);
 
   if (text.includes("#EXT-X-STREAM-INF")) {
@@ -541,17 +700,17 @@ async function resolveFirstSegments(m3u8Url, maxSegs = 1) {
     if (!res || res.height === null) {
       streams.sort((a, b) => b.bw - a.bw);
       chosen = streams[0];
-      console.log(`[proxy] master: best quality (${chosen.h}p, ${chosen.bw}bps)`);
+      dlog(`[proxy] master: best quality (${chosen.h}p, ${chosen.bw}bps)`);
     } else {
       streams.sort((a, b) => {
         const da = Math.abs(a.h - res.height), db = Math.abs(b.h - res.height);
         return da !== db ? da - db : b.bw - a.bw;
       });
       chosen = streams[0];
-      console.log(`[proxy] master: ${chosen.h}p (target: ${res.height}p, bw: ${chosen.bw})`);
+      dlog(`[proxy] master: ${chosen.h}p (target: ${res.height}p, bw: ${chosen.bw})`);
     }
 
-    console.log(`[proxy] media playlist: ${chosen.u.slice(0, 100)}`);
+    dlog(`[proxy] media playlist: ${chosen.u.slice(0, 100)}`);
     return resolveFirstSegments(chosen.u, maxSegs);
   }
 
@@ -559,14 +718,16 @@ async function resolveFirstSegments(m3u8Url, maxSegs = 1) {
     .filter(l => !l.startsWith("#") && (l.includes("/") || l.includes(".") || l.includes("?")))
     .map(l => resolveUrl(l, base));
 
-  console.log(`[proxy] ${segs.length} segments found`);
-  if (segs.length > 0) console.log(`[proxy] seg[0]: ${segs[0].slice(0, 100)}`);
-  else console.warn(`[proxy] ⚠ No segments found! Lines: ${lines.slice(0, 10).join(" | ")}`);
+  const durationMatch = text.match(/#EXT-X-TARGETDURATION:(\d+(?:\.\d+)?)/);
+  const duration = durationMatch ? parseFloat(durationMatch[1]) : 6; // fallback estimate (sec)
 
-  return maxSegs > 0 ? segs.slice(0, maxSegs) : segs;
+  dlog(`[proxy] ${segs.length} segments found`);
+  if (segs.length > 0) dlog(`[proxy] seg[0]: ${segs[0].slice(0, 100)}`);
+  else dwarn(`[proxy] ⚠ No segments found! Lines: ${lines.slice(0, 10).join(" | ")}`);
+
+  return { segs: maxSegs > 0 ? segs.slice(0, maxSegs) : segs, duration };
 }
 
-// ── GPU decoder detection ──────────────────────────────────
 let gpuDecoder = null;
 
 async function detectGpuDecoder() {
@@ -589,7 +750,6 @@ async function detectGpuDecoder() {
   return false;
 }
 
-// ── Encoder detection ──────────────────────────────────────
 let availableEncoder = null;
 
 async function detectEncoder() {
@@ -611,9 +771,8 @@ async function detectEncoder() {
   process.exit(1);
 }
 
-// ── ffmpeg args builder ────────────────────────────────────
 function buildFfmpegArgs(gpu, height) {
-  const args        = ["-loglevel", "error"];
+  const args        = ["-loglevel", "error", "-progress", "pipe:2", "-nostats"];
   const cpuThreads  = Math.max(1, os.cpus().length);
 
   if (gpu) {
@@ -625,8 +784,7 @@ function buildFfmpegArgs(gpu, height) {
 
   args.push("-threads", String(cpuThreads), "-i", "pipe:0");
 
-  if (height) args.push("-vf", `scale=-2:${height},format=yuv420p`);
-  else        args.push("-vf", "format=yuv420p");
+  args.push("-vf", buildScaleFilter(height));
 
   const isUltraHigh = !height || height > 720;
   const isHighRes   = height >= 720;
@@ -654,11 +812,29 @@ function buildFfmpegArgs(gpu, height) {
   return args;
 }
 
-// runFfmpegPipeSegment — downloads the segment and pipes it directly into
-// ffmpeg's stdin (no full-segment buffering). ffmpeg starts encoding as soon
-// as the first byte arrives, saving roughly 0.5–2s versus buffer-then-encode.
-// Returns the full WebM Buffer (for caching) while also streaming it to `res`.
-function runFfmpegPipeSegment(segUrl, ffArgs, res, req) {
+
+function makeProgressParser(duration, onProgress) {
+  if (!onProgress) return () => {};
+  let buf = "";
+  return chunk => {
+    buf += chunk.toString("utf8");
+    let idx;
+    while ((idx = buf.indexOf("\n")) !== -1) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      const outTimeMatch = line.match(/^out_time_ms=(\d+)/) || line.match(/^out_time_us=(\d+)/);
+      if (outTimeMatch) {
+        const seconds = parseInt(outTimeMatch[1], 10) / 1e6;
+        const pct = duration > 0 ? Math.min(99, (seconds / duration) * 100) : 0;
+        onProgress(pct);
+      } else if (/^progress=end/.test(line)) {
+        onProgress(100);
+      }
+    }
+  };
+}
+
+function runFfmpegPipeSegment(segUrl, ffArgs, res, req, duration, onDownloadProgress, onTranscodeProgress) {
   return new Promise(async (resolve, reject) => {
     let aborted = false;
     const ff    = spawn("ffmpeg", ffArgs);
@@ -667,13 +843,12 @@ function runFfmpegPipeSegment(segUrl, ffArgs, res, req) {
     const onClientClose = () => {
       if (aborted) return;
       aborted = true;
-      console.log("[proxy] client disconnected — killing ffmpeg");
+      dlog("[proxy] client disconnected — killing ffmpeg");
       try { ff.kill("SIGKILL"); } catch (_) {}
       reject(new Error("client disconnected"));
     };
     req?.on("close", onClientClose);
 
-    // Headers go out before ffmpeg starts producing output (MSE-ready)
     res.writeHead(200, {
       "Content-Type"     : "video/webm",
       "Transfer-Encoding": "chunked",
@@ -681,18 +856,24 @@ function runFfmpegPipeSegment(segUrl, ffArgs, res, req) {
       "X-Cache"          : "MISS",
     });
 
+    const parseProgress = makeProgressParser(duration, onTranscodeProgress);
+
     ff.stdout.on("data", chunk => {
       if (aborted) return;
       chunks.push(chunk);
       if (!res.writableEnded) res.write(chunk);
     });
-    ff.stderr.on("data", d => { if (!aborted) process.stderr.write("[ffmpeg] " + d); });
+    ff.stderr.on("data", d => {
+      if (aborted) return;
+      parseProgress(d);
+      if (DEBUG) process.stderr.write("[ffmpeg] " + d);
+    });
 
     ff.on("close", code => {
       req?.off("close", onClientClose);
       if (!res.writableEnded) res.end();
       if (aborted) return;
-      if (code === 0 && chunks.length > 0) resolve(Buffer.concat(chunks));
+      if (code === 0 && chunks.length > 0) { if (onTranscodeProgress) onTranscodeProgress(100); resolve(Buffer.concat(chunks)); }
       else reject(new Error(`ffmpeg exit ${code} (chunks: ${chunks.length})`));
     });
 
@@ -705,13 +886,18 @@ function runFfmpegPipeSegment(segUrl, ffArgs, res, req) {
         : err);
     });
 
-    // Stdin closing early when the segment ends is normal — don't reject for it
     ff.stdin.on("error", err => {
       if (err.code !== "EPIPE" && err.code !== "EOF") {}
     });
 
     try {
       const segStream = await fetchStream(segUrl);
+      const total = parseInt(segStream.headers?.["content-length"] || "0", 10);
+      let received = 0;
+      segStream.on("data", chunk => {
+        received += chunk.length;
+        if (onDownloadProgress) onDownloadProgress(total > 0 ? Math.min(100, (received / total) * 100) : 0);
+      });
       segStream.pipe(ff.stdin);
       segStream.on("error", err => {
         if (!aborted) {
@@ -728,8 +914,6 @@ function runFfmpegPipeSegment(segUrl, ffArgs, res, req) {
   });
 }
 
-// runFfmpegStream — buffer-first fallback, used for in-flight dedup where the
-// segment stream can't be re-piped to a second consumer
 function runFfmpegStream(ffArgs, inputBuf, res, req) {
   return new Promise((resolve, reject) => {
     const ff     = spawn("ffmpeg", ffArgs);
@@ -739,7 +923,7 @@ function runFfmpegStream(ffArgs, inputBuf, res, req) {
     const onClientClose = () => {
       if (aborted) return;
       aborted = true;
-      console.log("[proxy] client disconnected — killing ffmpeg");
+      dlog("[proxy] client disconnected — killing ffmpeg");
       try { ff.kill("SIGKILL"); } catch (_) {}
       reject(new Error("client disconnected"));
     };
@@ -781,21 +965,24 @@ function runFfmpegStream(ffArgs, inputBuf, res, req) {
     });
 
     try { ff.stdin.write(inputBuf); ff.stdin.end(); }
-    catch (e) { /* stdin closed early, wait for close event */ }
+    catch (e) {  }
   });
 }
 
-// runFfmpeg — buffer mode, used for pre-transcode with no HTTP response to stream into
-function runFfmpeg(ffArgs, inputBuf) {
+function runFfmpeg(ffArgs, inputBuf, onProgress, duration) {
   return new Promise((resolve, reject) => {
     const ff     = spawn("ffmpeg", ffArgs);
     const chunks = [];
+    const parseProgress = makeProgressParser(duration, onProgress);
 
     ff.stdout.on("data", c => chunks.push(c));
-    ff.stderr.on("data", d => process.stderr.write("[ffmpeg] " + d));
+    ff.stderr.on("data", d => {
+      parseProgress(d);
+      if (DEBUG) process.stderr.write("[ffmpeg] " + d);
+    });
 
     ff.on("close", code => {
-      if (code === 0 && chunks.length > 0) resolve(Buffer.concat(chunks));
+      if (code === 0 && chunks.length > 0) { if (onProgress) onProgress(100); resolve(Buffer.concat(chunks)); }
       else reject(new Error(`ffmpeg exit ${code} (chunks: ${chunks.length})`));
     });
 
@@ -810,42 +997,50 @@ function runFfmpeg(ffArgs, inputBuf) {
     });
 
     try { ff.stdin.write(inputBuf); ff.stdin.end(); }
-    catch (e) { /* stdin closed early */ }
+    catch (e) {  }
   });
 }
 
-// prewarmTranscode — called right after /artwork resolves an m3u8. Downloads
-// and transcodes in the background so the result is already cached (or
-// nearly done) by the time the extension calls /transcode.
-async function prewarmTranscode(m3u8Url) {
+async function prewarmTranscode(m3u8Url, boardId) {
   const cached = webmCache.get(m3u8Url);
   if (cached && (Date.now() - cached.ts) < WEBM_CACHE_TTL_MS) {
-    console.log(`[proxy] prewarm: webm cache already warm`);
+    dlog(`[proxy] prewarm: webm cache already warm`);
+    board.finish(boardId, true);
     return;
   }
   if (inFlight.has(m3u8Url)) {
-    console.log(`[proxy] prewarm: transcode already in-flight`);
+    dlog(`[proxy] prewarm: transcode already in-flight`);
     return;
   }
 
-  console.log(`[proxy] 🔥 prewarm: starting background transcode`);
+  dlog(`[proxy] 🔥 prewarm: starting background transcode`);
+  board.update(boardId, { status: "downloading" });
 
   const transcodePromise = (async () => {
     try {
-      const segs = await resolveFirstSegments(m3u8Url, 1);
+      const { segs, duration } = await resolveFirstSegments(m3u8Url, 1);
       if (segs.length === 0) throw new Error("No segments");
 
-      const tsBuf = await fetchBuf(segs[0], {
+      const tsBuf = await fetchBufWithProgress(segs[0], {
         "Referer": "https://music.apple.com/",
         "Origin" : "https://music.apple.com",
-      }, 6);
+      }, pct => board.update(boardId, { downloadPct: pct }));
+
+      board.update(boardId, { status: "transcoding" });
       const gpu   = gpuDecoder || null;
-      const webm  = await runFfmpeg(buildFfmpegArgs(gpu, selectedResolution?.height ?? null), tsBuf);
+      const webm  = await runFfmpeg(
+        buildFfmpegArgs(gpu, selectedResolution?.height ?? null),
+        tsBuf,
+        pct => board.update(boardId, { transcodePct: pct }),
+        duration
+      );
       webmCacheSet(m3u8Url, webm);
-      console.log(`[proxy] 🔥 prewarm: done (${(webm.length / 1024).toFixed(0)} KB cached)`);
+      dlog(`[proxy] 🔥 prewarm: done (${(webm.length / 1024).toFixed(0)} KB cached)`);
+      board.finish(boardId, true);
       return webm;
     } catch (e) {
-      console.warn(`[proxy] prewarm failed: ${e.message}`);
+      dwarn(`[proxy] prewarm failed: ${e.message}`);
+      board.finish(boardId, false, e.message.slice(0, 60));
       throw e;
     }
   })();
@@ -854,7 +1049,6 @@ async function prewarmTranscode(m3u8Url) {
   transcodePromise.finally(() => inFlight.delete(m3u8Url));
 }
 
-// ── HTTP Server ────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin",  "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -864,16 +1058,12 @@ const server = http.createServer(async (req, res) => {
 
   const parsed = new URL(req.url, `http://localhost:${PORT}`);
 
-  // GET /extension-hash — hash of the extension code currently on disk (for auto-update detection)
   if (parsed.pathname === "/extension-hash") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ hash: currentExtensionHash || null }));
     return;
   }
 
-  // POST /write-extension — receives new extension code from the browser
-  // extension, saves it to disk, and updates the in-memory hash.
-  // Body: text/plain UTF-8 (new .mjs code)
   if (parsed.pathname === "/write-extension" && req.method === "POST") {
     let bodyBuf;
     try {
@@ -906,7 +1096,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // GET /ping
   if (parsed.pathname === "/ping") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
@@ -921,7 +1110,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // GET /artwork
   if (parsed.pathname === "/artwork") {
     const artist = parsed.searchParams.get("artist") || "";
     const album  = parsed.searchParams.get("album")  || "";
@@ -932,26 +1120,30 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: "Missing artist or title" }));
       return;
     }
+
+    const boardId = board.add(artist, title, album);
+
     try {
-      const { m3u8, source } = await resolveM3u8(artist, album, title);
+      const { m3u8, source } = await resolveM3u8(artist, album, title, boardId);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ m3u8: m3u8 || null, source: source || null }));
 
-      // Prewarm the transcode as soon as the m3u8 is found, without waiting
-      // for the extension to call /transcode. 800ms delay avoids bursting
-      // Apple's CDN right after the playlist fetch.
       if (m3u8) {
-        setTimeout(() => prewarmTranscode(m3u8).catch(() => {}), 800);
+        m3u8ToTrack.set(m3u8, boardId);
+        setTimeout(() => prewarmTranscode(m3u8, boardId).catch(() => {}), 800);
+      } else {
+        board.finish(boardId, false, "artwork not found");
       }
     } catch (e) {
+      board.pause();
       console.error("[proxy] /artwork error:", e.message);
+      board.finish(boardId, false, e.message.slice(0, 60));
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: e.message }));
     }
     return;
   }
 
-  // GET /transcode
   if (parsed.pathname === "/transcode") {
     const m3u8Url = parsed.searchParams.get("url");
     if (!m3u8Url || m3u8Url === "null" || m3u8Url === "undefined") {
@@ -961,13 +1153,16 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(400); res.end(`Invalid URL: ${m3u8Url.slice(0, 80)}`); return;
     }
 
+    const boardId = m3u8ToTrack.get(m3u8Url);
+
     try {
-      // 1. WebM cache hit → send directly (fastest, already prewarmed)
+
       const cached = webmCache.get(m3u8Url);
       if (cached && (Date.now() - cached.ts) < WEBM_CACHE_TTL_MS) {
         cached.hitCount++;
         if (cached.hitCount === 1)
-          console.log(`[proxy] ✓ webm cache hit (${(cached.webm.length / 1024).toFixed(0)} KB)`);
+          dlog(`[proxy] ✓ webm cache hit (${(cached.webm.length / 1024).toFixed(0)} KB)`);
+        board.finish(boardId, true);
         res.writeHead(200, {
           "Content-Type"  : "video/webm",
           "Content-Length": cached.webm.length,
@@ -978,9 +1173,8 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // 2. In-flight dedup (prewarm already running) → wait, then stream the result
       if (inFlight.has(m3u8Url)) {
-        console.log(`[proxy] ⏳ prewarm in-flight — joining and streaming result`);
+        dlog(`[proxy] ⏳ prewarm in-flight — joining and streaming result`);
         const webm = await inFlight.get(m3u8Url);
         res.writeHead(200, {
           "Content-Type"  : "video/webm",
@@ -992,34 +1186,38 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // 3. Cold start: pipe segment directly to ffmpeg (no full-segment buffering)
-      console.log(`[proxy] ❄ cold transcode (pipe): ${m3u8Url.slice(0, 80)}...`);
+      dlog(`[proxy] ❄ cold transcode (pipe): ${m3u8Url.slice(0, 80)}...`);
       const t0 = Date.now();
+      board.update(boardId, { status: "downloading" });
 
-      let segs;
+      let segs, duration;
       for (let attempt = 1; attempt <= 6; attempt++) {
-        try { segs = await resolveFirstSegments(m3u8Url, 1); break; }
+        try { ({ segs, duration } = await resolveFirstSegments(m3u8Url, 1)); break; }
         catch (e) {
           const retryable = e.message.includes("ECONNRESET") || e.message.includes("Timeout") ||
                             e.message.includes("ECONNREFUSED");
           if (!retryable || attempt === 6) throw e;
-          console.warn(`[proxy] playlist retry ${attempt}/5 (${e.message.slice(0, 50)})`);
+          dwarn(`[proxy] playlist retry ${attempt}/5 (${e.message.slice(0, 50)})`);
           await new Promise(r => setTimeout(r, 80 + attempt * 40));
         }
       }
       if (!segs || segs.length === 0) throw new Error("No segments found in playlist");
 
-      console.log(`[proxy] playlist resolve: ${Date.now() - t0}ms — piping segment directly to ffmpeg`);
+      dlog(`[proxy] playlist resolve: ${Date.now() - t0}ms — piping segment directly to ffmpeg`);
 
       const gpu   = gpuDecoder || null;
       const ffArgs = buildFfmpegArgs(gpu, selectedResolution?.height ?? null);
 
-      const transcodePromise = runFfmpegPipeSegment(segs[0], ffArgs, res, req)
-        .then(webm => {
-          console.log(`[proxy] ✓ cold transcode done: ${(webm.length / 1024).toFixed(0)} KB (${Date.now() - t0}ms total)`);
-          webmCacheSet(m3u8Url, webm);
-          return webm;
-        });
+      const transcodePromise = runFfmpegPipeSegment(
+        segs[0], ffArgs, res, req, duration,
+        pct => board.update(boardId, { downloadPct: pct, status: "downloading" }),
+        pct => board.update(boardId, { transcodePct: pct, status: "transcoding" })
+      ).then(webm => {
+        dlog(`[proxy] ✓ cold transcode done: ${(webm.length / 1024).toFixed(0)} KB (${Date.now() - t0}ms total)`);
+        webmCacheSet(m3u8Url, webm);
+        board.finish(boardId, true);
+        return webm;
+      });
 
       inFlight.set(m3u8Url, transcodePromise);
       try {
@@ -1030,7 +1228,9 @@ const server = http.createServer(async (req, res) => {
       return;
 
     } catch (e) {
+      board.pause();
       console.error("[proxy] transcode error:", e.message);
+      board.finish(boardId, false, e.message.slice(0, 60));
       if (!res.headersSent) {
         res.writeHead(500, { "Content-Type": "text/plain" });
         res.end(`Error: ${e.message}`);
@@ -1039,7 +1239,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST /local-transcode  — transcode MP4/WebM/GIF upload → video/webm
   if (parsed.pathname === "/local-transcode" && req.method === "POST") {
     const ct = req.headers["content-type"] || "";
     let bodyBuf;
@@ -1065,25 +1264,26 @@ const server = http.createServer(async (req, res) => {
       fileBuf  = file.data;
       mimeType = file.contentType || "video/mp4";
     } else {
-      // raw binary body (preferred — more reliable than multipart)
+
       fileBuf  = bodyBuf;
       mimeType = ct.split(";")[0].trim() || "video/mp4";
     }
 
     if (!fileBuf || fileBuf.length === 0) { res.writeHead(400); res.end("Empty file"); return; }
 
-    console.log(`[proxy] local-transcode: ${mimeType}, ${(fileBuf.length / 1024).toFixed(0)} KB`);
+    dlog(`[proxy] local-transcode: ${mimeType}, ${(fileBuf.length / 1024).toFixed(0)} KB`);
 
-    // Write to a temp file so ffmpeg can seek (MP4 with moov-at-end needs it)
     const tmpExt  = mimeType.includes("gif") ? ".gif" : mimeType.includes("webm") ? ".webm" : ".mp4";
     const tmpPath = path.join(os.tmpdir(), `animart_${Date.now()}${tmpExt}`);
-    console.log(`[proxy] local-transcode: writing temp file → ${tmpPath}`);
+    dlog(`[proxy] local-transcode: writing temp file → ${tmpPath}`);
     try {
       fs.writeFileSync(tmpPath, fileBuf);
       const stat = fs.statSync(tmpPath);
-      console.log(`[proxy] local-transcode: temp file written (${(stat.size / 1024).toFixed(0)} KB)`);
+      dlog(`[proxy] local-transcode: temp file written (${(stat.size / 1024).toFixed(0)} KB)`);
     } catch (e) {
+      board.pause();
       console.error(`[proxy] local-transcode: temp file FAILED: ${e.message}`);
+      board.render();
       res.writeHead(500); res.end("Temp file write error: " + e.message); return;
     }
 
@@ -1093,7 +1293,7 @@ const server = http.createServer(async (req, res) => {
       const cpuThreads = Math.max(1, os.cpus().length);
 
       const args = ["-loglevel", "warning", "-y",
-        // tolerate partial/malformed containers
+
         "-fflags", "+genpts+igndts+discardcorrupt",
         "-err_detect", "ignore_err",
       ];
@@ -1105,11 +1305,9 @@ const server = http.createServer(async (req, res) => {
         else if (gpu.hwaccel === "videotoolbox") args.push("-hwaccel", "videotoolbox");
       }
 
-      // Input from file, not a pipe, so ffmpeg can seek to the moov atom at the end
       args.push("-threads", String(cpuThreads), "-i", tmpPath);
 
-      if (height) args.push("-vf", `scale=-2:${height},format=yuv420p`);
-      else        args.push("-vf", "format=yuv420p");
+      args.push("-vf", buildScaleFilter(height));
 
       const crf = !height || height > 720 ? "36" : height >= 720 ? "34" : "33";
       args.push(
@@ -1145,7 +1343,7 @@ const server = http.createServer(async (req, res) => {
         ));
       });
 
-      console.log(`[proxy] local-transcode: done (${(webm.length / 1024).toFixed(0)} KB WebM)`);
+      dlog(`[proxy] local-transcode: done (${(webm.length / 1024).toFixed(0)} KB WebM)`);
       res.writeHead(200, {
         "Content-Type"  : "video/webm",
         "Content-Length": webm.length,
@@ -1153,23 +1351,24 @@ const server = http.createServer(async (req, res) => {
       });
       res.end(webm);
     } catch (e) {
+      board.pause();
       console.error("[proxy] local-transcode error:", e.message);
+      board.render();
       if (!res.headersSent) {
         res.writeHead(500, { "Content-Type": "text/plain" });
         res.end("Transcode error: " + e.message);
       }
     } finally {
-      // Hapus temp file
+
       try { fs.unlinkSync(tmpPath); } catch (_) {}
     }
     return;
   }
 
-  // GET /cache/clear
   if (parsed.pathname === "/cache/clear") {
     const m3u8Count = cache.size, webmCount = webmCache.size;
     cache.clear(); webmCache.clear();
-    console.log(`[proxy] cache cleared — m3u8: ${m3u8Count}, webm: ${webmCount} entries`);
+    dlog(`[proxy] cache cleared — m3u8: ${m3u8Count}, webm: ${webmCount} entries`);
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end(`Cache cleared (m3u8: ${m3u8Count}, webm: ${webmCount} entries removed)`);
     return;
@@ -1178,7 +1377,6 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404); res.end("Not found");
 });
 
-// ── Startup ────────────────────────────────────────────────
 (async () => {
   loadExtensionHash();
   await runStartupUpdateCheck();
@@ -1214,7 +1412,7 @@ const server = http.createServer(async (req, res) => {
     console.log(`   API-2: iTunes Search + Apple Music scrape`);
     console.log(`\n🗃  WebM Cache: max ${WEBM_CACHE_MAX} tracks, TTL 2h`);
     console.log(`⚡ v3 optimizations: prewarm + direct pipe + MSE streaming`);
-    console.log(`💡 Tip: node animart-proxy.js 1080  → use 1080p directly`);
+    console.log(`💡 Tip: node animart-proxy.js 1080  → switch & save 1080p`);
     console.log(`⚠  Requires ffmpeg: winget install ffmpeg\n`);
   });
 
