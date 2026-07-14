@@ -45,13 +45,32 @@ class TrackBoard {
   constructor() {
     this.tracks       = new Map();  
     this.order        = [];
-    this.linesPrinted = 0;
     this.seq          = 0;
     this.enabled      = process.stdout.isTTY === true;
     this._renderTimer = null;
   }
 
   add(artist, title, album) {
+    // If the most recent row is the exact same track (same artist/title/album),
+    // reuse it instead of pushing a new row. This is what previously happened
+    // on every retry/re-lookup of the same song (e.g. a failed search, or the
+    // frontend calling /artwork again) — each call added a brand-new panel for
+    // an already-displayed song, which is why the same title kept stacking up.
+    const key = `${artist || ""}|${title || ""}|${album || ""}`.toLowerCase();
+    const lastId = this.order[this.order.length - 1];
+    if (lastId) {
+      const last = this.tracks.get(lastId);
+      if (last && `${last.artist}|${last.title}|${last.album}`.toLowerCase() === key) {
+        last.status       = "searching";
+        last.source        = null;
+        last.downloadPct   = 0;
+        last.transcodePct  = 0;
+        last.note          = "";
+        this.render();
+        return lastId;
+      }
+    }
+
     const id = `t${++this.seq}`;
     this.tracks.set(id, {
       artist: artist || "Unknown Artist",
@@ -96,8 +115,14 @@ class TrackBoard {
   }
 
   _lines() {
-    const W = 64;
-    const rule = "─".repeat(W);
+    const cols  = process.stdout.columns > 0 ? process.stdout.columns : 80;
+    const W     = Math.max(20, Math.min(64, cols - 1));
+    const rule  = "─".repeat(W);
+    const trunc = (s, max) => {
+      const arr = Array.from(String(s));
+      return arr.length <= max ? s : arr.slice(0, Math.max(0, max - 1)).join("") + "…";
+    };
+    const fieldMax = Math.max(10, cols - 13);
     const lines = [rule, "🎵  ANIMART PROXY — Now Playing / Queue", rule];
     if (this.order.length === 0) {
       lines.push("   (waiting for a song...)");
@@ -109,10 +134,10 @@ class TrackBoard {
       const tail = t.status === "notfound" || t.status === "failed"
         ? `  ✗ ${t.note || STATUS_LABEL[t.status]}`
         : t.status === "ready" ? "  ✓ cached" : "";
-      lines.push(`Song      : ${t.title}`);
-      lines.push(`Album     : ${t.album}`);
-      lines.push(`Artist    : ${t.artist}`);
-      lines.push(`Source    : ${src}${tail}`);
+      lines.push(`Song      : ${trunc(t.title, fieldMax)}`);
+      lines.push(`Album     : ${trunc(t.album, fieldMax)}`);
+      lines.push(`Artist    : ${trunc(t.artist, fieldMax)}`);
+      lines.push(`Source    : ${trunc(src + tail, fieldMax)}`);
       lines.push(`Download  : ${drawBar(t.downloadPct)}`);
       lines.push(`Transcode : ${drawBar(t.transcodePct)}`);
       lines.push("");
@@ -128,27 +153,38 @@ class TrackBoard {
     this._renderTimer = setTimeout(() => {
       this._renderTimer = null;
       this.render();
-    }, 120);
+    }, 150);
+  }
+
+  // Switch to the terminal's alternate screen buffer so our redraws happen in
+  // an isolated view, the same way full-screen CLI tools (vim, htop, less)
+  // do. Without this, console.clear() on classic Windows PowerShell/conhost
+  // only clears the *visible* area — every previous frame stays in scrollback,
+  // which is why the same song panel appeared to "stack up" repeatedly.
+  enterAltScreen() {
+    if (!this.enabled) return;
+    process.stdout.write("\x1b[?1049h");
+  }
+
+  leaveAltScreen() {
+    if (!this.enabled) return;
+    process.stdout.write("\x1b[?1049l");
   }
 
   pause() {
     if (this._renderTimer) { clearTimeout(this._renderTimer); this._renderTimer = null; }
-    if (!this.enabled || this.linesPrinted === 0) return;
-    readline.moveCursor(process.stdout, 0, -this.linesPrinted);
+    if (!this.enabled) return;
+    readline.cursorTo(process.stdout, 0, 0);
     readline.clearScreenDown(process.stdout);
-    this.linesPrinted = 0;
   }
 
   render() {
     if (!this.enabled) return;
     if (this._renderTimer) { clearTimeout(this._renderTimer); this._renderTimer = null; }
     const lines = this._lines();
-    if (this.linesPrinted > 0) {
-      readline.moveCursor(process.stdout, 0, -this.linesPrinted);
-      readline.clearScreenDown(process.stdout);
-    }
+    readline.cursorTo(process.stdout, 0, 0);
+    readline.clearScreenDown(process.stdout);
     process.stdout.write(lines.join("\n") + "\n");
-    this.linesPrinted = lines.length;
   }
 }
 
@@ -516,23 +552,6 @@ function fetchStream(targetUrl, signal) {
 const fetchText = async (u, h, signal) => (await fetchBuf(u, h, 5, signal)).toString("utf8");
 const fetchJson = async (u, h, signal) => JSON.parse(await fetchText(u, h, signal));
 
-
-async function fetchBufWithProgress(targetUrl, extraHeaders = {}, onProgress) {
-  const stream = await fetchStream(targetUrl);
-  const total  = parseInt(stream.headers?.["content-length"] || "0", 10);
-  let received = 0;
-  const chunks = [];
-  return new Promise((resolve, reject) => {
-    stream.on("data", chunk => {
-      chunks.push(chunk);
-      received += chunk.length;
-      if (onProgress) onProgress(total > 0 ? Math.min(99, (received / total) * 100) : 0);
-    });
-    stream.on("end", () => { if (onProgress) onProgress(100); resolve(Buffer.concat(chunks)); });
-    stream.on("error", reject);
-  });
-}
-
 function sanitize(str) {
   if (!str) return "";
   return str
@@ -849,19 +868,21 @@ function runFfmpegPipeSegment(segUrl, ffArgs, res, req, duration, onDownloadProg
     };
     req?.on("close", onClientClose);
 
-    res.writeHead(200, {
-      "Content-Type"     : "video/webm",
-      "Transfer-Encoding": "chunked",
-      "Cache-Control"    : "no-store",
-      "X-Cache"          : "MISS",
-    });
+    if (res) {
+      res.writeHead(200, {
+        "Content-Type"     : "video/webm",
+        "Transfer-Encoding": "chunked",
+        "Cache-Control"    : "no-store",
+        "X-Cache"          : "MISS",
+      });
+    }
 
     const parseProgress = makeProgressParser(duration, onTranscodeProgress);
 
     ff.stdout.on("data", chunk => {
       if (aborted) return;
       chunks.push(chunk);
-      if (!res.writableEnded) res.write(chunk);
+      if (res && !res.writableEnded) res.write(chunk);
     });
     ff.stderr.on("data", d => {
       if (aborted) return;
@@ -871,7 +892,7 @@ function runFfmpegPipeSegment(segUrl, ffArgs, res, req, duration, onDownloadProg
 
     ff.on("close", code => {
       req?.off("close", onClientClose);
-      if (!res.writableEnded) res.end();
+      if (res && !res.writableEnded) res.end();
       if (aborted) return;
       if (code === 0 && chunks.length > 0) { if (onTranscodeProgress) onTranscodeProgress(100); resolve(Buffer.concat(chunks)); }
       else reject(new Error(`ffmpeg exit ${code} (chunks: ${chunks.length})`));
@@ -879,7 +900,7 @@ function runFfmpegPipeSegment(segUrl, ffArgs, res, req, duration, onDownloadProg
 
     ff.on("error", err => {
       req?.off("close", onClientClose);
-      if (!res.writableEnded) res.end();
+      if (res && !res.writableEnded) res.end();
       if (aborted) return;
       reject(err.code === "ENOENT"
         ? new Error("ffmpeg not found in PATH. Install: winget install ffmpeg")
@@ -914,93 +935,6 @@ function runFfmpegPipeSegment(segUrl, ffArgs, res, req, duration, onDownloadProg
   });
 }
 
-function runFfmpegStream(ffArgs, inputBuf, res, req) {
-  return new Promise((resolve, reject) => {
-    const ff     = spawn("ffmpeg", ffArgs);
-    const chunks = [];
-    let   aborted = false;
-
-    const onClientClose = () => {
-      if (aborted) return;
-      aborted = true;
-      dlog("[proxy] client disconnected — killing ffmpeg");
-      try { ff.kill("SIGKILL"); } catch (_) {}
-      reject(new Error("client disconnected"));
-    };
-    req?.on("close", onClientClose);
-
-    res.writeHead(200, {
-      "Content-Type"    : "video/webm",
-      "Transfer-Encoding": "chunked",
-      "Cache-Control"   : "no-store",
-      "X-Cache"         : "MISS",
-    });
-
-    ff.stdout.on("data", chunk => {
-      if (aborted) return;
-      chunks.push(chunk);
-      if (!res.writableEnded) res.write(chunk);
-    });
-    ff.stderr.on("data", d => { if (!aborted) process.stderr.write("[ffmpeg] " + d); });
-
-    ff.on("close", code => {
-      req?.off("close", onClientClose);
-      if (!res.writableEnded) res.end();
-      if (aborted) return;
-      if (code === 0 && chunks.length > 0) resolve(Buffer.concat(chunks));
-      else reject(new Error(`ffmpeg exit ${code} (chunks: ${chunks.length})`));
-    });
-
-    ff.on("error", err => {
-      req?.off("close", onClientClose);
-      if (!res.writableEnded) res.end();
-      if (aborted) return;
-      reject(err.code === "ENOENT"
-        ? new Error("ffmpeg not found in PATH. Install: winget install ffmpeg")
-        : err);
-    });
-
-    ff.stdin.on("error", err => {
-      if (err.code !== "EPIPE" && err.code !== "EOF") reject(err);
-    });
-
-    try { ff.stdin.write(inputBuf); ff.stdin.end(); }
-    catch (e) {  }
-  });
-}
-
-function runFfmpeg(ffArgs, inputBuf, onProgress, duration) {
-  return new Promise((resolve, reject) => {
-    const ff     = spawn("ffmpeg", ffArgs);
-    const chunks = [];
-    const parseProgress = makeProgressParser(duration, onProgress);
-
-    ff.stdout.on("data", c => chunks.push(c));
-    ff.stderr.on("data", d => {
-      parseProgress(d);
-      if (DEBUG) process.stderr.write("[ffmpeg] " + d);
-    });
-
-    ff.on("close", code => {
-      if (code === 0 && chunks.length > 0) { if (onProgress) onProgress(100); resolve(Buffer.concat(chunks)); }
-      else reject(new Error(`ffmpeg exit ${code} (chunks: ${chunks.length})`));
-    });
-
-    ff.on("error", err => {
-      reject(err.code === "ENOENT"
-        ? new Error("ffmpeg not found in PATH. Install: winget install ffmpeg")
-        : err);
-    });
-
-    ff.stdin.on("error", err => {
-      if (err.code !== "EPIPE" && err.code !== "EOF") reject(err);
-    });
-
-    try { ff.stdin.write(inputBuf); ff.stdin.end(); }
-    catch (e) {  }
-  });
-}
-
 async function prewarmTranscode(m3u8Url, boardId) {
   const cached = webmCache.get(m3u8Url);
   if (cached && (Date.now() - cached.ts) < WEBM_CACHE_TTL_MS) {
@@ -1021,19 +955,15 @@ async function prewarmTranscode(m3u8Url, boardId) {
       const { segs, duration } = await resolveFirstSegments(m3u8Url, 1);
       if (segs.length === 0) throw new Error("No segments");
 
-      const tsBuf = await fetchBufWithProgress(segs[0], {
-        "Referer": "https://music.apple.com/",
-        "Origin" : "https://music.apple.com",
-      }, pct => board.update(boardId, { downloadPct: pct }));
+      const gpu    = gpuDecoder || null;
+      const ffArgs = buildFfmpegArgs(gpu, selectedResolution?.height ?? null);
 
-      board.update(boardId, { status: "transcoding" });
-      const gpu   = gpuDecoder || null;
-      const webm  = await runFfmpeg(
-        buildFfmpegArgs(gpu, selectedResolution?.height ?? null),
-        tsBuf,
-        pct => board.update(boardId, { transcodePct: pct }),
-        duration
+      const webm = await runFfmpegPipeSegment(
+        segs[0], ffArgs, null, null, duration,
+        pct => board.update(boardId, { downloadPct: pct, status: "downloading" }),
+        pct => board.update(boardId, { transcodePct: pct, status: "transcoding" })
       );
+
       webmCacheSet(m3u8Url, webm);
       dlog(`[proxy] 🔥 prewarm: done (${(webm.length / 1024).toFixed(0)} KB cached)`);
       board.finish(boardId, true);
@@ -1130,7 +1060,7 @@ const server = http.createServer(async (req, res) => {
 
       if (m3u8) {
         m3u8ToTrack.set(m3u8, boardId);
-        setTimeout(() => prewarmTranscode(m3u8, boardId).catch(() => {}), 800);
+        prewarmTranscode(m3u8, boardId).catch(() => {});
       } else {
         board.finish(boardId, false, "artwork not found");
       }
@@ -1190,35 +1120,40 @@ const server = http.createServer(async (req, res) => {
       const t0 = Date.now();
       board.update(boardId, { status: "downloading" });
 
-      let segs, duration;
-      for (let attempt = 1; attempt <= 6; attempt++) {
-        try { ({ segs, duration } = await resolveFirstSegments(m3u8Url, 1)); break; }
-        catch (e) {
-          const retryable = e.message.includes("ECONNRESET") || e.message.includes("Timeout") ||
-                            e.message.includes("ECONNREFUSED");
-          if (!retryable || attempt === 6) throw e;
-          dwarn(`[proxy] playlist retry ${attempt}/5 (${e.message.slice(0, 50)})`);
-          await new Promise(r => setTimeout(r, 80 + attempt * 40));
+      const transcodePromise = (async () => {
+        let segs, duration;
+        for (let attempt = 1; attempt <= 6; attempt++) {
+          try { ({ segs, duration } = await resolveFirstSegments(m3u8Url, 1)); break; }
+          catch (e) {
+            const retryable = e.message.includes("ECONNRESET") || e.message.includes("Timeout") ||
+                              e.message.includes("ECONNREFUSED");
+            if (!retryable || attempt === 6) throw e;
+            dwarn(`[proxy] playlist retry ${attempt}/5 (${e.message.slice(0, 50)})`);
+            await new Promise(r => setTimeout(r, 80 + attempt * 40));
+          }
         }
-      }
-      if (!segs || segs.length === 0) throw new Error("No segments found in playlist");
+        if (!segs || segs.length === 0) throw new Error("No segments found in playlist");
 
-      dlog(`[proxy] playlist resolve: ${Date.now() - t0}ms — piping segment directly to ffmpeg`);
+        dlog(`[proxy] playlist resolve: ${Date.now() - t0}ms — piping segment directly to ffmpeg`);
 
-      const gpu   = gpuDecoder || null;
-      const ffArgs = buildFfmpegArgs(gpu, selectedResolution?.height ?? null);
+        const gpu    = gpuDecoder || null;
+        const ffArgs = buildFfmpegArgs(gpu, selectedResolution?.height ?? null);
 
-      const transcodePromise = runFfmpegPipeSegment(
-        segs[0], ffArgs, res, req, duration,
-        pct => board.update(boardId, { downloadPct: pct, status: "downloading" }),
-        pct => board.update(boardId, { transcodePct: pct, status: "transcoding" })
-      ).then(webm => {
+        const webm = await runFfmpegPipeSegment(
+          segs[0], ffArgs, res, req, duration,
+          pct => board.update(boardId, { downloadPct: pct, status: "downloading" }),
+          pct => board.update(boardId, { transcodePct: pct, status: "transcoding" })
+        );
         dlog(`[proxy] ✓ cold transcode done: ${(webm.length / 1024).toFixed(0)} KB (${Date.now() - t0}ms total)`);
         webmCacheSet(m3u8Url, webm);
         board.finish(boardId, true);
         return webm;
-      });
+      })();
 
+      // Registered synchronously (no await above this line since the IIFE
+      // was invoked) so a concurrent prewarm/request can't slip past the
+      // inFlight check above and start a second, duplicate download —
+      // that duplication was what made the progress bar jump around.
       inFlight.set(m3u8Url, transcodePromise);
       try {
         await transcodePromise;
@@ -1395,6 +1330,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   server.listen(PORT, "127.0.0.1", () => {
+    board.enterAltScreen();
     const decodeMode = gpuDecoder ? `GPU (${gpuDecoder.label})` : "CPU only";
     console.log(`\n✅ animart-proxy v3 running at http://localhost:${PORT}`);
     console.log(`   Resolution : ${selectedResolution?.label || "720p default"}`);
@@ -1423,4 +1359,8 @@ const server = http.createServer(async (req, res) => {
       console.error("Server error:", e.message);
     process.exit(1);
   });
+
+  const restoreScreen = () => { board.leaveAltScreen(); process.exit(0); };
+  process.on("SIGINT",  restoreScreen);
+  process.on("SIGTERM", restoreScreen);
 })();
