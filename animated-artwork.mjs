@@ -1,7 +1,3 @@
-// ============================================================
-//  animated-artwork.mjs  —  Spicetify Extension v2
-//  Requires: animart-proxy v2 running at localhost:7799
-// ============================================================
 
 (async function AnimatedArtworkV2() {
 
@@ -11,26 +7,20 @@
 
   const PROXY_BASE = "http://localhost:7799";
 
-  // ── Auto-Update (silent, tanpa tombol) ────────────────────
-  // Fetch versi terbaru dari GitHub, bandingkan dengan kode yang sedang berjalan.
-  // Jika ada perbedaan: simpan file baru ke Spicetify extensions folder via proxy
-  // /write-extension, lalu reload extension secara otomatis.
   const GITHUB_RAW_URL = "https://raw.githubusercontent.com/JustHfizz/Artworks-Animation-Spicy-Lyrics/main/animated-artwork.mjs";
 
   async function checkAndAutoUpdate() {
     try {
-      // Ambil kode terbaru dari GitHub (timeout 8 detik)
+
       const resp = await fetch(GITHUB_RAW_URL, {
         signal: AbortSignal.timeout(8000),
         cache : "no-store",
       });
-      if (!resp.ok) return; // GitHub tidak dapat dijangkau, lanjutkan normal
+      if (!resp.ok) return;
 
       const remoteCode = await resp.text();
-      if (!remoteCode || remoteCode.length < 100) return; // respons tidak valid
+      if (!remoteCode || remoteCode.length < 100) return;
 
-      // Ekstrak versi dari baris komentar header (cth: "Spicetify Extension v2.1")
-      // Jika tidak ada tag versi, bandingkan panjang + hash sederhana
       const extractVer = code => {
         const m = code.match(/Spicetify Extension\s+v([\d.]+)/i);
         return m ? m[1] : null;
@@ -38,15 +28,12 @@
       const remoteVer = extractVer(remoteCode);
       const localVer  = extractVer(document.currentScript?.textContent || "");
 
-      // Hash ringan (djb2) untuk perbandingan konten tanpa crypto API
       const djb2 = str => {
         let h = 5381;
         for (let i = 0; i < str.length; i++) h = ((h << 5) + h) ^ str.charCodeAt(i);
         return (h >>> 0).toString(36);
       };
 
-      // Ambil hash dari kode yang sedang berjalan (melalui proxy /self-hash)
-      // Proxy menyimpan hash saat startup (lihat animart-proxy.js)
       let needsUpdate = false;
       try {
         const hashResp = await fetch(`${PROXY_BASE}/extension-hash`, {
@@ -63,7 +50,6 @@
           }
         }
       } catch {
-        // Proxy tidak support /extension-hash (versi lama) → fallback ke versi string
         if (remoteVer && localVer) {
           needsUpdate = remoteVer !== localVer;
         }
@@ -73,7 +59,6 @@
 
       L(`Auto-update: mengirim file baru ke proxy untuk disimpan...`);
 
-      // Kirim kode baru ke proxy → proxy simpan ke disk & catat hash baru
       const writeResp = await fetch(`${PROXY_BASE}/write-extension`, {
         method : "POST",
         headers: { "Content-Type": "text/plain; charset=utf-8" },
@@ -88,23 +73,17 @@
 
       L(`Auto-update: file berhasil diperbarui ✓ — mereload extension...`);
 
-      // Spicetify tidak punya API reload extension per-file,
-      // jadi kita inject ulang kode baru langsung ke dalam halaman
       const script = document.createElement("script");
       script.type  = "module";
       script.text  = remoteCode;
       document.head.appendChild(script);
-      // Script lama tetap berjalan hingga tab ditutup,
-      // tapi instance baru akan meng-override handler Spicetify
 
     } catch (e) {
-      // Jangan crash extension karena gagal update
+
       E(`Auto-update: ${e.message}`);
     }
   }
 
-  // Jalankan pengecekan update ~3 detik setelah ekstensi ready
-  // (delay agar tidak mengganggu startup awal)
   setTimeout(() => checkAndAutoUpdate(), 3000);
   const TAG        = "[AnimArt]";
   const L          = (...a) => console.log(`%c${TAG}`, "color:#1DB954;font-weight:bold", ...a);
@@ -117,9 +96,6 @@
     } catch { return false; }
   }
 
-  // ── SharedVideo ────────────────────────────────────────────
-  // One video element per track. Transcoding happens only once.
-  // Multiple CanvasMirrors simply copy frames from here.
   class SharedVideo {
     constructor() {
       this.video        = null;
@@ -128,11 +104,11 @@
       this.ready        = false;
       this.isLoading    = false;
       this._loadPromise = null;
-      this._ac          = null;   // AbortController to cancel in-progress /transcode fetch
+      this._ac          = null;
     }
 
     destroy() {
-      // cancel in-progress /transcode fetch (if any)
+
       if (this._ac) { this._ac.abort(); this._ac = null; }
       this.ready     = false;
       this.isLoading = false;
@@ -148,11 +124,8 @@
       if (this.blobUrl) { URL.revokeObjectURL(this.blobUrl); this.blobUrl = null; }
     }
 
-    // Fetch WebM from proxy (transcode once), store as blob
     async load(m3u8Url) {
-      // If already loaded for the same URL, return immediately
       if (this.ready && this.m3u8Url === m3u8Url) return true;
-      // If already loading the same URL, wait for it
       if (this.isLoading && this.m3u8Url === m3u8Url && this._loadPromise) {
         return this._loadPromise;
       }
@@ -230,197 +203,141 @@
     }
   }
 
-  // ── CanvasMirror ───────────────────────────────────────────
-  // Renders frames from SharedVideo onto a canvas in a given container.
-  // Does no transcoding at all.
-  // Supports pause() / resume() so the draw loop only runs when visible.
-  class CanvasMirror {
+  // NOTE ON SMOOTHNESS: earlier versions mirrored the shared <video> onto each
+  // target by capturing frames in JS (createImageBitmap → OffscreenCanvas
+  // worker / canvas.drawImage) on every rVFC/rAF tick. That's an extra
+  // decode-and-recompress step *per target, per frame*, done on the CPU, and
+  // is exactly what caused stutter once more than one target was visible at
+  // once (NPV + Album, etc). Real animated-cover extensions (e.g.
+  // GuayabR/Motion-Artworks) don't mirror frames at all — they drop an actual
+  // <video> element into each container and let the browser's own hardware
+  // video decoder + compositor handle it, same as a normal <video> tag on any
+  // web page. That's what VideoOverlay does below: no canvas, no worker, no
+  // per-frame JS at all — just a positioned, looping <video>.
+  class VideoOverlay {
     constructor(id, sharedVideo) {
       this.id          = id;
       this.sv          = sharedVideo;
-      this.canvas      = null;
-      this.ctx         = null;
-      this.raf         = null;
-      this._rvfcId     = null;
-      this._stopMirror = null;
-      this.running     = false;   // draw loop active
-      this.isPlaying   = false;   // mounted and ready
-      this.isPaused    = false;   // temporarily suspended (not visible)
-      this.isInjecting = false;
-      this._cachedW    = 0;       // cache video dimensions to skip resize every frame
-      this._cachedH    = 0;
-    }
-
-    destroy() {
-      this.running     = false;
+      this.video       = null;
       this.isPlaying   = false;
       this.isPaused    = false;
       this.isInjecting = false;
-      this._cachedW    = 0;
-      this._cachedH    = 0;
+    }
 
-      if (this._stopMirror) { this._stopMirror(); this._stopMirror = null; }
-      if (this.raf)         { cancelAnimationFrame(this.raf); this.raf = null; }
-      if (this._rvfcId && this.sv.video) {
-        try { this.sv.video.cancelVideoFrameCallback(this._rvfcId); } catch (_) {}
-        this._rvfcId = null;
-      }
-      document.getElementById(`${this.id}-canvas`)?.remove();
-      this.canvas = null;
-      this.ctx    = null;
+    destroy() {
+      this.isPlaying   = false;
+      this.isPaused    = false;
+      this.isInjecting = false;
+      document.getElementById(`${this.id}-video`)?.remove();
+      this.video = null;
     }
 
     isActive() {
       if (!this.isPlaying) return false;
-      const canvas = document.getElementById(`${this.id}-canvas`);
-      return !!canvas && document.body.contains(canvas);
+      const el = document.getElementById(`${this.id}-video`);
+      return !!el && document.body.contains(el);
     }
 
-    // Pause draw loop temporarily (canvas stays, last frame remains visible)
     pause() {
       if (!this.isPlaying || this.isPaused) return;
       this.isPaused = true;
-      this.running  = false;
-      if (this._stopMirror) { this._stopMirror(); this._stopMirror = null; }
-      if (this.raf)         { cancelAnimationFrame(this.raf); this.raf = null; }
-      if (this._rvfcId && this.sv.video) {
-        try { this.sv.video.cancelVideoFrameCallback(this._rvfcId); } catch (_) {}
-        this._rvfcId = null;
-      }
-      L(`${this.id}: draw loop paused (off-screen)`);
+      this.video?.pause();
+      L(`${this.id}: paused (off-screen)`);
     }
 
-    // Resume the draw loop
     resume() {
       if (!this.isPlaying || !this.isPaused) return;
-      if (!this.sv.ready || !this.sv.video || !this.canvas) return;
+      if (!this.video) return;
       this.isPaused = false;
-      this._startMirror();
-      L(`${this.id}: draw loop resumed (on-screen)`);
+      this.syncToMaster();
+      this.video.play().catch(() => {});
+      L(`${this.id}: resumed (on-screen)`);
     }
 
-    _mount(container) {
-      document.getElementById(`${this.id}-canvas`)?.remove();
-
-      const canvas           = document.createElement("canvas");
-      canvas.id              = `${this.id}-canvas`;
-      canvas.dataset.animart = "1";
-      // will-change:transform → browser promotes to GPU compositing layer
-      // desynchronized context → draw off main thread, eliminates jank
-      // opacity set to 1 immediately, no fade-in delay
-      // FIX 3: contain:strict → isolates canvas from parent layout reflow (lyric scroll, etc.)
-      canvas.style.cssText   = "position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:inherit;z-index:10;pointer-events:none;opacity:1;will-change:transform;contain:strict;transform:translateZ(0);backface-visibility:hidden;";
-      container.style.position = "relative";
-      container.style.overflow = "hidden";
-      container.appendChild(canvas);
-
-      this.canvas = canvas;
-      // desynchronized: true → canvas draw doesn't wait for vsync on main thread
-      this.ctx    = canvas.getContext("2d", { alpha: false, willReadFrequently: false, desynchronized: true });
-    }
-
-    _startMirror() {
-      this.running  = true;
-      this._cachedW = 0;
-      this._cachedH = 0;
-      const v = this.sv.video;
-
-      // FIX 4: rVFC only for large canvas (fullscreen). Small canvas (Now Bar) uses rAF+throttle.
-      // rVFC on small canvas runs at 60fps unthrottled → wastes CPU.
-      const isSmallCanvas = (this.canvas?.clientWidth || this.canvas?.width || 9999) < 200;
-      if (typeof v.requestVideoFrameCallback === "function" && !isSmallCanvas) {
-        const onFrame = () => {
-          if (!this.running) return;
-          const { videoWidth: w, videoHeight: h } = v;
-          if (w === 0 || h === 0) { this._rvfcId = v.requestVideoFrameCallback(onFrame); return; }
-          // only resize canvas if video dimensions actually changed
-          if (w !== this._cachedW || h !== this._cachedH) {
-            this.canvas.width  = w;
-            this.canvas.height = h;
-            this._cachedW = w;
-            this._cachedH = h;
-          }
-          try { this.ctx.drawImage(v, 0, 0, w, h); } catch (_) { return; }
-          if (this.canvas.style.opacity !== "1") {
-            this.canvas.style.opacity = "1";
-            L(`${this.id}: ✓ visible (${w}×${h})`);
-          }
-          this._rvfcId = v.requestVideoFrameCallback(onFrame);
-        };
-        this._rvfcId     = v.requestVideoFrameCallback(onFrame);
-        this._stopMirror = () => {
-          if (this._rvfcId) { v.cancelVideoFrameCallback(this._rvfcId); this._rvfcId = null; }
-        };
-        return;
+    // Each target has its OWN <video> element (that's what makes this
+    // smooth — no shared frame-copying), but that means each one plays
+    // independently from the moment it was injected. If the animated cover
+    // changes color/scene noticeably over its loop, two targets injected a
+    // few seconds apart will show visibly different moments of it — which
+    // is exactly the "kok beda tampilannya" symptom. Sync everyone's
+    // currentTime to the hidden reference <video> inside SharedVideo /
+    // SharedVideoLocal (which starts playing the instant the source loads
+    // and never stops), so all targets stay locked to the same instant.
+    syncToMaster() {
+      const master = this.sv?.video;
+      if (!this.video || !master) return;
+      if (master.paused || master.seeking || master.readyState < 2) return;
+      const drift = Math.abs(this.video.currentTime - master.currentTime);
+      if (drift > 0.12) {
+        try { this.video.currentTime = master.currentTime; } catch (_) {}
       }
-
-      // rAF fallback
-      let _lastTime  = -1;
-      let _frameSkip = 0;
-      // FIX 2: Now Bar small canvas → throttle to ~20fps (skip 1 of every 2 frames)
-      // Fullscreen large canvas → run all frames (skip 0)
-      const _getThrottle = () => {
-        const w = this.canvas?.clientWidth || this.canvas?.width || 9999;
-        return w < 200 ? 1 : 0;  // Now Bar is typically < 80px
-      };
-      const draw = () => {
-        if (!this.running) return;
-        this.raf = requestAnimationFrame(draw);
-        if (document.visibilityState === "hidden") return;
-        if (!v || v.readyState < 2 || v.paused || v.ended || v.videoWidth === 0) return;
-        // skip frames for small canvas (Now Bar)
-        if (_frameSkip > 0) { _frameSkip--; return; }
-        _frameSkip = _getThrottle();
-        // skip if frame hasn't changed yet
-        if (v.currentTime === _lastTime) return;
-        _lastTime = v.currentTime;
-        const { videoWidth: w, videoHeight: h } = v;
-        // only resize canvas if video dimensions actually changed
-        if (w !== this._cachedW || h !== this._cachedH) {
-          this.canvas.width  = w;
-          this.canvas.height = h;
-          this._cachedW = w;
-          this._cachedH = h;
-        }
-        try { this.ctx.drawImage(v, 0, 0, w, h); } catch (_) { return; }
-        if (this.canvas.style.opacity !== "1") {
-          this.canvas.style.opacity = "1";
-          L(`${this.id}: ✓ visible (${w}×${h})`);
-        }
-      };
-      this.raf         = requestAnimationFrame(draw);
-      this._stopMirror = () => { if (this.raf) { cancelAnimationFrame(this.raf); this.raf = null; } };
     }
 
-    // Inject canvas into container and mirror from a ready SharedVideo
     async show(container) {
       this.destroy();
-      this._mount(container);
       this.isInjecting = true;
 
-      if (!this.sv.ready || !this.sv.video) {
+      const blobUrl = this.sv?.blobUrl;
+      if (!this.sv?.ready || !blobUrl) {
         E(`${this.id}: SharedVideo not ready`);
         this.isInjecting = false;
         return false;
       }
 
       try {
-        this._startMirror();
+        const rect = container.getBoundingClientRect();
+        if (rect.width < 8 || rect.height < 8) {
+          throw new Error(`container too small to be a real target (${Math.round(rect.width)}x${Math.round(rect.height)}) — likely matched the wrong element`);
+        }
+
+        container.style.position = "relative";
+        container.style.overflow = "hidden";
+
+        const video           = document.createElement("video");
+        video.id               = `${this.id}-video`;
+        video.dataset.animart   = "1";
+        video.muted             = true;
+        video.loop              = true;
+        video.playsInline       = true;
+        video.autoplay          = true;
+        video.preload           = "auto";
+        video.disablePictureInPicture = true;
+        // object-fit:cover + inset:0 mirrors the sizing the old canvas used,
+        // so containers don't need any layout changes. z-index sits above
+        // the underlying <img> so it visually replaces it without removing it.
+        // !important guards against host-page CSS rules (e.g. `img, video {
+        // width: ... }`) fighting for control of size/position.
+        video.style.cssText = "position:absolute!important;inset:0!important;width:100%!important;height:100%!important;object-fit:cover!important;object-position:center!important;border-radius:inherit;z-index:10;pointer-events:none;opacity:0;transition:opacity .2s ease;";
+        container.appendChild(video);
+        this.video = video;
+        video.src  = blobUrl;
+
+        await new Promise((resolve, reject) => {
+          video.oncanplay = resolve;
+          video.onerror   = () => reject(new Error(`video error: ${video.error?.message || "?"}`));
+          setTimeout(() => reject(new Error("timeout canplay")), 8000);
+        });
+
+        // Jump to the master clock's current position *before* the first
+        // paint, so this target never even flashes a mismatched frame.
+        this.syncToMaster();
+
+        await video.play().catch(e => E(`${this.id}: play error:`, e.message));
+        video.style.opacity = "1";
+
         this.isPlaying   = true;
         this.isInjecting = false;
-        L(`${this.id}: mirror started (no transcode) ✓`);
+        L(`${this.id}: playing, synced to master (direct <video>, no frame-copy) ✓`);
         return true;
       } catch (e) {
         E(`${this.id}: show failed:`, e.message);
         this.destroy();
+        this.isInjecting = false;
         return false;
       }
     }
   }
 
-  // ── MirrorManager ──────────────────────────────────────────
-  // Ensures only ONE draw loop is active at a time.
-  // Mirrors that are not visible are paused, not destroyed.
   const MirrorManager = {
     _mirrors: [],
 
@@ -428,40 +345,50 @@
       this._mirrors = mirrors;
     },
 
-    // Detect which canvas is currently visible in the viewport
-    // Avoids getBoundingClientRect() to prevent triggering layout reflow
+    // Was using checkVisibility()/offsetParent, which can misreport a
+    // target as "not visible" while it's mid CSS transform/transition —
+    // exactly what the Right Panel sidebar does when it slides in/out.
+    // That caused it to get paused immediately after every successful
+    // inject ("playing, synced to master ✓" followed instantly by
+    // "paused (off-screen)"). Use the same rect-size check that
+    // firstVisible() already relies on elsewhere in this file — proven
+    // reliable for every other target — instead.
     _isVisible(mirror) {
-      const canvas = mirror.canvas;
-      if (!canvas || !document.body.contains(canvas)) return false;
-      // checkVisibility is cheaper than getBoundingClientRect (no forced reflow)
-      if (typeof canvas.checkVisibility === "function") {
-        return canvas.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true });
-      }
-      // fallback: use offsetParent — false if display:none
-      return canvas.offsetParent !== null || canvas.style.position === "fixed";
+      const el = mirror.video;
+      if (!el || !document.body.contains(el)) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 20 && r.height > 20;
     },
 
     update() {
       for (const m of this._mirrors) {
         if (!m.isPlaying) continue;
+
+        if (m.id === "animart-npv" && isInFullscreen()) {
+          if (!m.isPaused) m.pause();
+          continue;
+        }
         const visible = this._isVisible(m);
         if (visible && m.isPaused)   { m.resume(); }
         if (!visible && !m.isPaused) { m.pause();  }
+
+        // Each target's <video> decodes independently, so left uncorrected
+        // they gradually drift out of sync with each other the longer they
+        // play without being paused/resumed — this is why a target that's
+        // been sitting on-screen a while can end up showing a visibly
+        // different moment of the clip than one injected more recently.
+        // Re-sync everyone to the master clock on every visibility poll.
+        if (!m.isPaused && typeof m.syncToMaster === "function") m.syncToMaster();
       }
     },
   };
 
-  // ── LocalArtwork ───────────────────────────────────────────
-  // Stores local artwork per track URI (MP4/GIF/image from user).
-  // If a local override exists → SharedVideo uses the local blobUrl, not the proxy.
-  // If reset → SharedVideo falls back to the API cache (lastM3u8).
-  // All data stored in a Map (in-memory, persists across track changes).
   const LocalArtwork = {
-    // Map<uri, { blobUrl, type }>
+
     _store: new Map(),
 
     set(uri, file) {
-      // Revoke old blobUrl if present
+
       const old = this._store.get(uri);
       if (old) URL.revokeObjectURL(old.blobUrl);
       const blobUrl = URL.createObjectURL(file);
@@ -481,9 +408,6 @@
     has(uri) { return this._store.has(uri); },
   };
 
-  // ── SharedVideoLocal ───────────────────────────────────────
-  // Like SharedVideo but sourced from a local blobUrl (MP4/GIF/image).
-  // Reuses the same class structure so CanvasMirror needs no changes.
   class SharedVideoLocal {
     constructor() {
       this.video   = null;
@@ -500,7 +424,6 @@
         this.video.remove();
         this.video = null;
       }
-      // Don't revoke blobUrl here — it's managed by LocalArtwork._store
       this.blobUrl = null;
     }
 
@@ -508,22 +431,19 @@
       this.destroy();
       this.blobUrl = blobUrl;
 
-      // ── Determine whether transcoding is needed ──────────────────────
-      // WebM: plays directly. MP4/GIF/other: transcode to WebM first via proxy.
       const needsTranscode = mimeType !== "video/webm";
       let   playUrl = blobUrl;
 
       if (needsTranscode) {
         L(`SharedVideoLocal: transcode ${mimeType} → WebM via proxy`);
         try {
-          // Fetch blob as ArrayBuffer, send to /local-transcode as raw binary
-          // (raw binary is more reliable than multipart — no encoding overhead that could corrupt)
+
           const rawBuf = await fetch(blobUrl).then(r => r.arrayBuffer());
           const resp = await fetch(`${PROXY_BASE}/local-transcode`, {
             method: "POST",
             headers: { "Content-Type": mimeType },
             body: rawBuf,
-            signal: AbortSignal.timeout(120000), // 2 minutes timeout for large files
+            signal: AbortSignal.timeout(120000),
           });
           if (!resp.ok) {
             const errText = await resp.text().catch(() => "");
@@ -550,8 +470,12 @@
       video.preload      = "auto";
       video.style.cssText = "position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;left:-9999px;top:-9999px;";
       document.body.appendChild(video);
-      this.video = video;
-      video.src  = playUrl;
+      this.video   = video;
+      // Overlays read this.blobUrl directly to create their own <video> tags,
+      // so it must always point at something actually playable — the
+      // transcoded WebM when a transcode happened, not the original upload.
+      this.blobUrl = playUrl;
+      video.src    = playUrl;
 
       try {
         await new Promise((resolve, reject) => {
@@ -571,7 +495,6 @@
     }
   }
 
-  // ── LocalUI ────────────────────────────────────────────────
   const LocalUI = {
     _btn:  null,
     _open: false,
@@ -592,7 +515,7 @@
     },
 
     _findMarketplaceBtn() {
-      // Search using various possible selectors
+
       const sels = [
         "[data-testid='marketplace-button']",
         "[aria-label='Marketplace']","[aria-label='marketplace']",
@@ -603,13 +526,13 @@
         const el = document.querySelector(sel);
         if (el) return el;
       }
-      // Heuristic: rightmost button in the same bar as the animart button
+
       const btn = document.getElementById("animart-local-btn");
       if (btn) {
         const siblings = [...btn.parentElement.querySelectorAll("button")].filter(b => b !== btn);
         return siblings[siblings.length - 1] || null;
       }
-      // Fallback: icon-type buttons in the top bar
+
       for (const barSel of [".main-topBar-container","[data-testid='top-bar']",".Root__top-bar","[class*='topBar']"]) {
         const bar = document.querySelector(barSel);
         if (!bar) continue;
@@ -620,7 +543,7 @@
     },
 
     _cloneStyleFrom(srcEl) {
-      // Copy all visual computed styles from srcEl to a new element
+
       if (!srcEl) return {};
       const cs = window.getComputedStyle(srcEl);
       return {
@@ -638,6 +561,94 @@
       };
     },
 
+    // Ambil bentuk (radius/border/blur) dari tombol marketplace yang sudah ada di UI,
+    // supaya panel "Local Artwork" ikut mengikuti tema yang sedang terpasang di Spotify,
+    // bukan cuma nilai warna generik.
+    _getReferenceShape() {
+      const mktBtn = this._findMarketplaceBtn();
+      if (!mktBtn) return null;
+      return this._cloneStyleFrom(mktBtn);
+    },
+
+    // Hitung radius/border/blur panel berdasarkan referensi tombol marketplace + tema.
+    // Dipisah jadi helper supaya bisa dipakai ulang baik saat panel pertama dibuat
+    // maupun saat tema Spicetify berganti dan panel perlu disegarkan (_applyTheme).
+    _computePanelShape(theme) {
+      const ref = this._getReferenceShape();
+      let finalRadius = theme.panelRadius;
+      let finalBorder = `1px solid ${theme.borderC}`;
+      let finalBlur   = theme.blur;
+
+      if (ref) {
+        const parsePx = (val) => {
+          const m = String(val || "").match(/[\d.]+/);
+          return m ? parseFloat(m[0]) : null;
+        };
+        const refRadiusPx = parsePx(ref.borderRadius);
+        if (refRadiusPx) {
+          finalRadius = `${Math.max(10, Math.round(refRadiusPx * 1.6))}px`;
+        }
+        if (ref.border && !/^0px|none/.test(ref.border)) finalBorder = ref.border;
+        if (ref.backdropFilter) finalBlur = ref.backdropFilter;
+      }
+      return { finalRadius, finalBorder, finalBlur };
+    },
+
+    // Segarkan warna & bentuk tombol + panel memakai tema Spicetify yang sedang aktif
+    // SEKARANG (bukan yang tersimpan saat elemen pertama dibuat). Dipanggil manual
+    // sekali di awal, dan otomatis lewat _startThemeWatcher() tiap kali tema berganti.
+    _applyTheme() {
+      const theme = this._getThemeColors();
+
+      if (this._btn && document.body.contains(this._btn)) {
+        this._btn._theme = theme;
+        if (!this._btn._usedRealClasses && !this._btn._active) {
+          this._btn.style.background  = theme.btnC;
+          this._btn.style.borderColor = theme.borderC;
+        }
+      }
+
+      const panel = document.getElementById("animart-local-panel");
+      if (panel) {
+        const { finalRadius, finalBorder, finalBlur } = this._computePanelShape(theme);
+        Object.assign(panel.style, {
+          background:           theme.bg,
+          color:                theme.textC,
+          border:               finalBorder,
+          borderRadius:         finalRadius,
+          backdropFilter:       finalBlur,
+          WebkitBackdropFilter: finalBlur,
+        });
+        panel.style.setProperty("--animart-radius",            finalRadius);
+        panel.style.setProperty("--animart-btn-bg",             theme.btnC);
+        panel.style.setProperty("--animart-btn-border",         theme.borderC);
+        panel.style.setProperty("--animart-btn-hover-bg",       theme.btnHoverBg);
+        panel.style.setProperty("--animart-btn-hover-border",   theme.btnHoverBorder);
+        panel.style.setProperty("--animart-status-bg",          theme.statusBg);
+        panel.style.setProperty("--animart-status-border",      theme.statusBorder);
+      }
+    },
+
+    // Pantau pergantian tema Spicetify secara langsung (tanpa perlu reload Spotify):
+    // kebanyakan tema menerapkan warnanya lewat custom property di :root (style attr)
+    // atau lewat penggantian stylesheet di <head>, jadi kita amati keduanya.
+    _startThemeWatcher() {
+      if (this._themeObserver) return;
+      let debounceTimer = null;
+      const scheduleRefresh = () => {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => this._applyTheme(), 200);
+      };
+
+      this._themeObserver = new MutationObserver(scheduleRefresh);
+      this._themeObserver.observe(document.documentElement, {
+        attributes: true, attributeFilter: ["style", "class"],
+      });
+      this._themeObserver.observe(document.head, {
+        childList: true, subtree: true,
+      });
+    },
+
     _getOrCreateBtn() {
       const existing = document.getElementById("animart-local-btn");
       if (existing && document.body.contains(existing)) {
@@ -649,72 +660,119 @@
       if (!mktBtn) { L("LocalUI: ref button not found yet"); return null; }
 
       const s   = this._cloneStyleFrom(mktBtn);
+      const theme = this._getThemeColors();
       const btn = document.createElement("button");
       btn.id    = "animart-local-btn";
       btn.title = "Local Artwork";
-      btn.innerHTML = this._iconSVG(20);
+      btn.setAttribute("aria-label", "Local Artwork");
 
-      // Tentukan border-radius tombol berbasis PROPORSI UKURAN TOMBOL ITU
-      // SENDIRI (gaya "squircle" — kotak membulat), BUKAN dari hasil
-      // deteksi/clone tombol referensi yang ternyata tidak bisa diandalkan
-      // di tema Liquify (kadang ikut menangkap radius 50% / elemen lain yang
-      // kebetulan bulat). Ini meniru gaya ikon top bar Liquify (panah, cart)
-      // yang berbentuk kotak membulat — bukan pill (seperti chip "All /
-      // Music / Podcasts") dan bukan lingkaran penuh.
+      // Pakai className ASLI tombol marketplace apa adanya supaya tombol otomatis
+      // mendapat desain + efek (liquify-glass, radius, hover/active state, termasuk
+      // "chip" bulat yang diberikan tema lewat class globalNav/navLink) langsung dari
+      // CSS tema yang sedang aktif. Class ini aman dipakai ulang: Spotify adalah SPA
+      // React, navigasi/klik diikat ke elemen lewat handler React langsung — bukan
+      // lewat delegasi berbasis className secara global — jadi tidak memicu navigasi
+      // tak sengaja. Kalau karena suatu hal class-nya kosong, tetap fallback ke
+      // pendekatan lama supaya tombol tidak polos tanpa styling sama sekali.
+      const mktClasses = (mktBtn.className || "").split(/\s+/).filter(Boolean);
+      const usedRealClasses = mktClasses.length > 0;
+      if (usedRealClasses) btn.className = mktClasses.join(" ");
+
+      const encoreId = mktBtn.getAttribute("data-encore-id");
+      if (encoreId) btn.setAttribute("data-encore-id", encoreId);
+      const liquifyAttr = mktBtn.getAttribute("data-liquify");
+      if (liquifyAttr) btn.setAttribute("data-liquify", liquifyAttr);
+
+      // Bungkus ikon dengan struktur <span> yang sama seperti tombol asli (kalau
+      // ada) supaya posisi/centering ikon ikut aturan tema. SVG kita TIDAK ikut
+      // memakai class/style svg tombol asli — ikon marketplace itu icon-line
+      // sederhana 1 shape dengan var ukuran Encore tertentu, sedangkan ikon kita
+      // custom multi-shape sendiri; memaksakan class/style itu ke ikon kita
+      // membuat proporsinya rusak (gepeng/terpotong).
+      const mktIconWrapper = mktBtn.querySelector(":scope > span");
+      const iconHtml = this._iconSVG(20);
+      if (mktIconWrapper) {
+        const wrapClass = mktIconWrapper.getAttribute("class") || "";
+        btn.innerHTML = `<span aria-hidden="true"${wrapClass ? ` class="${wrapClass}"` : ""}>${iconHtml}</span>`;
+      } else {
+        btn.innerHTML = iconHtml;
+      }
+
       const parsePx = (val, fallback) => {
         const m = String(val || "").match(/[\d.]+/);
         return m ? parseFloat(m[0]) : fallback;
       };
-      const btnWidthPx  = parsePx(s.width, 36);
-      const btnHeightPx = parsePx(s.height, 36);
-      const baseSizePx  = Math.min(btnWidthPx, btnHeightPx) || 36;
-      // ~32% dari sisi terpendek = squircle yang jelas bersudut membulat,
-      // jauh dari 50% (lingkaran penuh).
-      const btnRadius = `${Math.max(8, Math.round(baseSizePx * 0.32))}px`;
 
-      // Mirror exact computed dimensions from reference button, then apply Liquify glass style
-      Object.assign(btn.style, {
-        display:             "inline-flex",
-        alignItems:          "center",
-        justifyContent:      "center",
-        width:               s.width,
-        height:              s.height,
-        minWidth:            s.minWidth,
-        borderRadius:        btnRadius,
-        // Glass background matching Liquify's frosted glass aesthetic
-        background:          "rgba(255,255,255,0.07)",
-        border:              "1px solid rgba(255,255,255,0.12)",
-        boxShadow:           "none",
-        padding:             s.padding,
-        color:               s.color,
-        backdropFilter:      "blur(8px)",
-        WebkitBackdropFilter:"blur(8px)",
-        margin:              "0 2px",
-        cursor:              "pointer",
-        flexShrink:          "0",
-        transition:          "background 0.18s ease, border-color 0.18s ease, transform 0.12s cubic-bezier(0.34,1.56,0.64,1), box-shadow 0.18s ease, color 0.15s",
-        WebkitAppRegion:     "no-drag",
-        boxSizing:           "border-box",
-      });
+      // Simpan warna tema & flag pendekatan yang dipakai, supaya handler hover di
+      // bawah dan _applyTheme() tahu apakah harus ikut menimpa warna (fallback) atau
+      // membiarkan CSS class asli yang mengatur (pendekatan utama).
+      btn._theme = theme;
+      btn._usedRealClasses = usedRealClasses;
+
+      const baseStyle = {
+        display:         "inline-flex",
+        alignItems:      "center",
+        justifyContent:  "center",
+        margin:          "0 2px",
+        cursor:          "pointer",
+        flexShrink:      "0",
+        WebkitAppRegion: "no-drag",
+        boxSizing:       "border-box",
+      };
+
+      if (usedRealClasses) {
+        // Class Encore-nya sendiri kadang punya ukuran default yang beda tergantung
+        // konteks parent (mis. medium vs large), jadi lebar/tinggi tetap kita paksa
+        // sama persis dengan tombol marketplace supaya chip-nya benar-benar sejajar
+        // dan selebar tombol lain di toolbar — sisanya (radius, background, efek
+        // liquify-glass, hover/active) tetap diserahkan ke class asli.
+        Object.assign(baseStyle, {
+          width:    s.width,
+          height:   s.height,
+          minWidth: s.minWidth,
+        });
+        baseStyle.transition = "transform 0.12s cubic-bezier(0.34,1.56,0.64,1)";
+      } else {
+        const btnWidthPx  = parsePx(s.width, 36);
+        const btnHeightPx = parsePx(s.height, 36);
+        const baseSizePx  = Math.min(btnWidthPx, btnHeightPx) || 36;
+        const btnRadius = `${Math.max(8, Math.round(baseSizePx * 0.32))}px`;
+        Object.assign(baseStyle, {
+          width:               s.width,
+          height:              s.height,
+          minWidth:            s.minWidth,
+          borderRadius:        btnRadius,
+          background:          theme.btnC,
+          border:              `1px solid ${theme.borderC}`,
+          boxShadow:           "none",
+          padding:             s.padding,
+          color:               s.color,
+          backdropFilter:      "blur(8px)",
+          WebkitBackdropFilter:"blur(8px)",
+          transition:          "background 0.18s ease, border-color 0.18s ease, transform 0.12s cubic-bezier(0.34,1.56,0.64,1), box-shadow 0.18s ease, color 0.15s",
+        });
+      }
+
+      Object.assign(btn.style, baseStyle);
 
       btn.addEventListener("mouseenter", () => {
-        if (!btn._active) {
-          btn.style.background   = "rgba(255,255,255,0.14)";
-          btn.style.borderColor  = "rgba(255,255,255,0.22)";
+        if (!usedRealClasses && !btn._active) {
+          btn.style.background   = btn._theme.btnHoverBg;
+          btn.style.borderColor  = btn._theme.btnHoverBorder;
         }
         btn.style.transform = "scale(1.08)";
       });
       btn.addEventListener("mouseleave", () => {
         btn.style.transform = "scale(1)";
-        if (!btn._active) {
-          btn.style.background  = "rgba(255,255,255,0.07)";
-          btn.style.borderColor = "rgba(255,255,255,0.12)";
+        if (!usedRealClasses && !btn._active) {
+          btn.style.background  = btn._theme.btnC;
+          btn.style.borderColor = btn._theme.borderC;
         }
       });
 
       btn.addEventListener("mousedown", (e) => {
         e.preventDefault(); e.stopImmediatePropagation();
-        // Click pulse animation
+
         btn.style.transform = "scale(0.88)";
         btn.style.transition = "transform 0.08s cubic-bezier(0.2,0,0.4,1)";
         setTimeout(() => {
@@ -724,51 +782,65 @@
       });
       btn.addEventListener("click",     (e) => { e.preventDefault(); e.stopImmediatePropagation(); this.toggle(); });
 
-      // Insert AFTER the marketplace button
       mktBtn.insertAdjacentElement("afterend", btn);
       this._btn = btn;
       L("LocalUI: button mounted ✓");
       return btn;
     },
 
-    // Read theme colors — prioritize reading Liquify's OWN rendered popup/menu
-    // (most accurate: mirrors exactly what the installed theme draws), then
-    // fall back to Spicetify --spice-* variables, then sane glass defaults.
     _getThemeColors() {
       const cssVar = (name, fallback = "") => {
         const val = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
         return val || fallback;
       };
 
-      // ── 1) Try to read Liquify's actual popup/context-menu element ──────
-      // Liquify renders its glass popups/menus with these classes — reading
-      // computed style from a live one gives the EXACT bg/blur/radius/border
-      // the theme uses, instead of guessing from CSS variables.
       const liquifyPopupSelectors = [
         ".main-contextMenu-menu",
         "[data-testid='context-menu']",
         "[class*='contextMenu'][class*='menu']",
-        ".main-card-card",          // Liquify card popup
+        ".main-card-card",
         "[class*='popup'][class*='liquify']",
         ".GenericModal__overlay [class*='Modal']",
         ".main-trackCreditsModal-container",
       ];
       let liveEl = null;
-      for (const sel of liquifyPopupSelectors) {
-        const el = document.querySelector(sel);
-        if (el && getComputedStyle(el).backgroundColor !== "rgba(0, 0, 0, 0)") { liveEl = el; break; }
+      let glassBgVar = "";
+
+      // Cari dulu secara GENERIK: elemen apa pun yang dipakai tema untuk kartu kaca
+      // (punya class "liquify-glass" / atribut "data-liquify"), yang memang sedang
+      // benar-benar tampil (bukan varian tersembunyi/opacity:0). Ini lebih tahan
+      // banting dibanding daftar selector tetap di bawah, karena tidak bergantung
+      // pada nama class spesifik yang bisa beda-beda tiap tema/versi Spotify —
+      // cukup ambil langsung dari div nyata yang dipakai tema yang sedang aktif.
+      const glassEls = document.querySelectorAll(".liquify-glass, [data-liquify]");
+      for (const el of glassEls) {
+        if (!el.offsetParent) continue;
+        const cs = getComputedStyle(el);
+        if (parseFloat(cs.opacity) < 0.5) continue;
+        const bgVar   = cs.getPropertyValue("--background-base").trim();
+        const hasBg   = cs.backgroundColor && cs.backgroundColor !== "rgba(0, 0, 0, 0)";
+        const hasBlur = cs.backdropFilter && cs.backdropFilter !== "none";
+        if (bgVar || hasBg || hasBlur) { liveEl = el; glassBgVar = bgVar; break; }
+      }
+
+      // Kalau tidak ketemu (mis. belum ada elemen liquify yang aktif saat ini),
+      // baru coba daftar selector popup/modal tetap seperti sebelumnya.
+      if (!liveEl) {
+        for (const sel of liquifyPopupSelectors) {
+          const el = document.querySelector(sel);
+          if (el && getComputedStyle(el).backgroundColor !== "rgba(0, 0, 0, 0)") { liveEl = el; break; }
+        }
       }
 
       let liveBg = "", liveRadius = "", liveBlur = "", liveBorder = "";
       if (liveEl) {
         const cs = getComputedStyle(liveEl);
-        liveBg     = cs.backgroundColor;
+        liveBg     = glassBgVar || cs.backgroundColor;
         liveRadius = cs.borderRadius;
         liveBlur   = cs.backdropFilter && cs.backdropFilter !== "none" ? cs.backdropFilter : "";
         liveBorder = cs.borderColor && cs.borderWidth !== "0px" ? cs.borderColor : "";
       }
 
-      // ── 2) Spicetify CSS variables (theme-declared) ──────────────────
       const spiceCard    = cssVar("--spice-card");
       const spiceSidebar = cssVar("--spice-sidebar");
       const spiceMain    = cssVar("--spice-main");
@@ -778,7 +850,6 @@
 
       const spiceBg = spiceCard || spiceSidebar || spiceMain;
 
-      // ── 3) Fallback: any visible chrome element ──────────────────────
       let rawBg = "";
       if (!liveBg && !spiceBg) {
         const bgSelectors = [
@@ -809,7 +880,6 @@
       }
       textC = textC || "#ffffff";
 
-      // ── Build final color values ──────────────────────────────
       const toRgba = (color, alpha) => {
         if (!color) return null;
         const m = color.match(/rgba?\((\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)(?:,\s*[\d.]+)?\)/);
@@ -823,89 +893,105 @@
         return null;
       };
 
-      // Source priority: live Liquify popup > --spice-card/sidebar/main > generic chrome
       const source = liveBg || spiceBg || rawBg;
 
       const bg      = toRgba(source, 0.55) || "rgba(24,24,24,0.55)";
       const borderC = toRgba(liveBorder || source, liveBorder ? 0.9 : 0.20) || "rgba(255,255,255,0.13)";
       const btnC    = toRgba(source, 0.10) || "rgba(255,255,255,0.06)";
 
+      // Varian untuk elemen "tombol" di dalam panel (status bar, upload label) supaya
+      // ikut warna tema, bukan abu-abu/putih tetap — termasuk state hover-nya.
+      const btnHoverBg     = toRgba(source, 0.20) || "rgba(255,255,255,0.12)";
+      const btnHoverBorder = toRgba(liveBorder || source, liveBorder ? 1 : 0.34) || "rgba(255,255,255,0.22)";
+      const statusBg       = toRgba(source, 0.09) || "rgba(255,255,255,0.07)";
+      const statusBorder   = toRgba(liveBorder || source, liveBorder ? 0.55 : 0.12) || "rgba(255,255,255,0.09)";
+
       const subC = spiceSub
         ? (toRgba(spiceSub, 0.85) || "rgba(255,255,255,0.55)")
         : (toRgba(textC, 0.60)    || "rgba(255,255,255,0.55)");
 
-      // Radius priority: live popup's actual radius > theme variable > Liquify's default ~18px
       const panelRadius = liveRadius || spiceRadius || "18px";
       const blur         = liveBlur || "blur(28px) saturate(180%)";
 
       L("theme src=" + (source||"none").slice(0,25) + " radius=" + panelRadius + " text=" + textC.slice(0,20));
-      return { bg, textC, subC, btnC, borderC, panelRadius, blur };
+      return { bg, textC, subC, btnC, borderC, panelRadius, blur, btnHoverBg, btnHoverBorder, statusBg, statusBorder };
     },
 
     _buildPanel() {
       document.getElementById("animart-local-panel")?.remove();
 
-      // Inject panel styles — Liquify glassmorphic theme integration
-      // Liquify uses heavy backdrop-blur, large rounded corners (16-20px), and glass-like panels.
-      // We mirror its aesthetic: blurred frosted glass card, subtle white borders, smooth transitions.
       if (!document.getElementById("animart-panel-style")) {
         const style = document.createElement("style");
         style.id = "animart-panel-style";
         style.textContent = `
-          /* ── Liquify-style glassmorphic panel ─────────────────── */
-          /* base look only — bg / radius / blur / border are set inline per-call
-             from _getThemeColors() so the panel actually follows the installed theme */
           #animart-local-panel {
             font-family: var(--font-family, var(--encore-body-font-stack, 'CircularSp', 'CircularSp-Arab', 'CircularSp-Hebr', 'CircularSp-Cyrl', 'CircularSp-Grek', 'CircularSp-Deva', 'var(--fallback-fonts)', sans-serif));
+            position: fixed;
+            z-index: 99999;
+            padding: 16px 16px 13px;
+            width: 268px;
+            user-select: none;
+
+            background: var(--spice-card, var(--spice-main, rgba(24,24,24,0.85)));
+            color: var(--spice-text, #ffffff);
+            border: 1px solid var(--spice-button-disabled, rgba(255,255,255,0.13));
+            border-radius: var(--spice-border-radius, 18px);
+            backdrop-filter: blur(28px) saturate(180%);
+            -webkit-backdrop-filter: blur(28px) saturate(180%);
             box-shadow:
               0 8px 32px rgba(0,0,0,0.45),
               0 2px 8px rgba(0,0,0,0.25),
-              inset 0 1px 0 rgba(255,255,255,0.1);
+              inset 0 1px 0 rgba(255,255,255,0.08);
             animation: animart-panel-in 0.18s cubic-bezier(0.34,1.4,0.64,1) both;
           }
           @keyframes animart-panel-in {
             from { opacity:0; transform: translateY(6px) scale(0.97); }
             to   { opacity:1; transform: translateY(0)   scale(1);    }
           }
-          /* Status pill */
           #animart-local-status {
-            background: rgba(255,255,255,0.07) !important;
-            border: 1px solid rgba(255,255,255,0.09) !important;
-            border-radius: calc(var(--animart-radius, 18px) * 0.55) !important;
-            color: var(--spice-subtext, rgba(255,255,255,0.55)) !important;
-            backdrop-filter: blur(4px) !important;
+            background: var(--spice-highlight, rgba(255,255,255,0.07));
+            border: 1px solid var(--spice-button-disabled, rgba(255,255,255,0.09));
+            border-radius: calc(var(--spice-border-radius, 18px) * 0.55);
+            color: var(--spice-subtext, rgba(255,255,255,0.55));
+            font-size: 11px;
+            padding: 6px 10px;
+            margin-bottom: 10px;
+            line-height: 1.4;
           }
-          /* Upload buttons — glass row */
           .animart-upload-label {
-            border: 1px solid rgba(255,255,255,0.11) !important;
-            border-radius: calc(var(--animart-radius, 18px) * 0.65) !important;
-            color: var(--spice-text, #ffffff) !important;
-            background: rgba(255,255,255,0.05) !important;
-            transition: background 0.18s ease, border-color 0.18s ease, transform 0.12s ease !important;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 9px 11px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
+            border: 1px solid var(--spice-button-disabled, rgba(255,255,255,0.11));
+            border-radius: calc(var(--spice-border-radius, 18px) * 0.65);
+            color: var(--spice-text, #ffffff);
+            background: var(--spice-highlight, rgba(255,255,255,0.05));
+            transition: filter 0.18s ease, transform 0.12s ease;
           }
           .animart-upload-label:hover {
-            background: rgba(255,255,255,0.12) !important;
-            border-color: rgba(255,255,255,0.22) !important;
-            transform: translateY(-1px) !important;
+            filter: brightness(1.35);
+            transform: translateY(-1px);
           }
           .animart-upload-label:active {
-            transform: scale(0.97) !important;
+            transform: scale(0.97);
           }
-          /* Reset button */
           #animart-reset-btn {
-            border-radius: calc(var(--animart-radius, 18px) * 0.65) !important;
-            transition: background 0.18s ease, transform 0.1s ease !important;
+            border-radius: calc(var(--spice-border-radius, 18px) * 0.65);
+            transition: filter 0.18s ease, transform 0.1s ease;
           }
           #animart-reset-btn:not(:disabled):hover {
-            transform: translateY(-1px) !important;
+            filter: brightness(1.3);
+            transform: translateY(-1px);
           }
-          /* Panel title divider */
           #animart-panel-divider {
             height: 1px;
-            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.12), transparent);
+            background: linear-gradient(90deg, transparent, var(--spice-button-disabled, rgba(255,255,255,0.12)), transparent);
             margin: 8px 0;
           }
-          /* Liquify-style active button glow ring */
           #animart-local-btn.animart-active {
             box-shadow: 0 0 0 2px var(--spice-button, #1DB954),
                         0 0 12px rgba(var(--spice-rgb-button, 29,185,84), 0.35) !important;
@@ -914,7 +1000,13 @@
         document.head.appendChild(style);
       }
 
-      const { bg, textC, subC, btnC, borderC, panelRadius, blur } = this._getThemeColors();
+      const { bg, textC, subC, btnC, borderC, panelRadius, blur, btnHoverBg, btnHoverBorder, statusBg, statusBorder } = this._getThemeColors();
+
+      // Turunkan bentuk panel (radius/border/blur) dari tombol marketplace kalau ketemu,
+      // supaya "bentuk" panel konsisten dengan tema yang terpasang — warna tetap dari
+      // _getThemeColors() karena warna tombol kecil biasanya kurang kontras kalau
+      // dipakai langsung sebagai background panel sebesar ini.
+      const { finalRadius, finalBorder, finalBlur } = this._computePanelShape({ panelRadius, borderC, blur });
 
       const panel = document.createElement("div");
       panel.id = "animart-local-panel";
@@ -925,15 +1017,21 @@
         width:          "268px",
         userSelect:     "none",
         display:        "none",
-        // ── Dynamic theme-matched look (follows the installed Liquify config) ──
+
         background:           bg,
         color:                textC,
-        border:               `1px solid ${borderC}`,
-        borderRadius:         panelRadius,
-        backdropFilter:       blur,
-        WebkitBackdropFilter: blur,
+        border:               finalBorder,
+        borderRadius:         finalRadius,
+        backdropFilter:       finalBlur,
+        WebkitBackdropFilter: finalBlur,
       });
-      panel.style.setProperty("--animart-radius", panelRadius);
+      panel.style.setProperty("--animart-radius", finalRadius);
+      panel.style.setProperty("--animart-btn-bg", btnC);
+      panel.style.setProperty("--animart-btn-border", borderC);
+      panel.style.setProperty("--animart-btn-hover-bg", btnHoverBg);
+      panel.style.setProperty("--animart-btn-hover-border", btnHoverBorder);
+      panel.style.setProperty("--animart-status-bg", statusBg);
+      panel.style.setProperty("--animart-status-border", statusBorder);
 
       const hasLocal = currentUri && LocalArtwork.has(currentUri);
 
@@ -988,7 +1086,6 @@
 
       document.body.appendChild(panel);
 
-      // Events file input
       const handleFile = async (file) => {
         if (!file || !currentUri) return;
         L(`LocalUI: file: ${file.name} (${file.type})`);
@@ -1015,15 +1112,13 @@
       if (!panel || !this._btn) return;
       const r   = this._btn.getBoundingClientRect();
       const pw  = 260;
-      const ph  = 230; // estimasi tinggi panel
+      const ph  = 230;
 
-      // Horizontal: center relative to button
       let left = r.left + r.width / 2 - pw / 2;
       left = Math.max(8, Math.min(left, window.innerWidth - pw - 8));
 
-      // Vertical: try ABOVE button first
       let top  = r.top - ph - 8;
-      // If clipped at the top, show BELOW the button
+
       if (top < 8) top = r.bottom + 8;
 
       panel.style.left   = left + "px";
@@ -1092,73 +1187,78 @@
     },
 
     initOutsideListener() {
-      // Single global listener — detects clicks outside button + panel → close
+
       document.addEventListener("click", (e) => {
         if (!this._open) return;
         const btn = document.getElementById("animart-local-btn");
         const pnl = document.getElementById("animart-local-panel");
-        if (btn && btn.contains(e.target)) return;   // click on button → toggle() handles it
-        if (pnl && pnl.contains(e.target)) return;   // click inside panel → allow
+        if (btn && btn.contains(e.target)) return;
+        if (pnl && pnl.contains(e.target)) return;
         this.close();
-      }, false);  // bubbling phase, not capture
+      }, false);
     },
   };
 
   let currentUri  = null;
   let lastM3u8    = null;
-  let lastSource  = null;   // "m8tec" | "apple" | "local" | null
+  let lastSource  = null;
   let proxyOk     = false;
   const sharedVideo      = new SharedVideo();
   const sharedVideoLocal = new SharedVideoLocal();
-  const playerNPV        = new CanvasMirror("animart-npv", sharedVideo);
-  const playerSL         = new CanvasMirror("animart-sl",  sharedVideo);
+  const playerNPV        = new VideoOverlay("animart-npv",   sharedVideo);
+  const playerSL         = new VideoOverlay("animart-sl",    sharedVideo);
+  const playerAlbum      = new VideoOverlay("animart-album", sharedVideo);
+  const playerMini       = new VideoOverlay("animart-mini",  sharedVideo);
+  const playerRightPanel = new VideoOverlay("animart-right", sharedVideo);
 
-  MirrorManager.register(playerNPV, playerSL);
+  MirrorManager.register(playerNPV, playerSL, playerAlbum, playerMini, playerRightPanel);
 
-  // ── activeSharedVideo: pointer indicating which source CanvasMirror reads from ─
-  // Default: sharedVideo (dari API). Jika local → sharedVideoLocal.
-  // CanvasMirror.sv must be updated when switching sources.
   function switchToVideo(sv) {
-    playerNPV.sv = sv;
-    playerSL.sv  = sv;
+    playerNPV.sv        = sv;
+    playerSL.sv         = sv;
+    playerAlbum.sv      = sv;
+    playerMini.sv       = sv;
+    playerRightPanel.sv = sv;
   }
 
-  // Apply local artwork for the current URI
   async function applyLocalArtwork(uri, file) {
     if (!uri) return;
-    // Save to LocalArtwork cache
+
     const blobUrl = LocalArtwork.set(uri, file);
 
-    // Stop mirror draw loop (don't destroy API sharedVideo — keep cache alive)
     playerNPV.destroy();
     playerSL.destroy();
+    playerAlbum.destroy();
+    playerMini.destroy();
+    playerRightPanel.destroy();
 
-    // Load into SharedVideoLocal
     const ok = await sharedVideoLocal.load(blobUrl, file.type);
     if (!ok) { E("LocalArtwork: failed to load local video"); return; }
 
-    // Switch mirror to local source
     switchToVideo(sharedVideoLocal);
 
-    tryInject(playerNPV, findNpv, "NPV (local)");
-    tryInject(playerSL,  findSL,  "SL  (local)");
+    tryInjectNpv("NPV (local)");
+    tryInject(playerSL,         findSL,         "SL    (local)");
+    tryInject(playerAlbum,      findAlbumPage,  "Album (local)");
+    tryInject(playerMini,       findMiniPlayer, "Mini  (local)");
+    tryInject(playerRightPanel, findRightPanel, "Right (local)");
     L(`LocalArtwork: active for ${uri}`);
   }
 
-  // Reset to API artwork (from still-alive sharedVideo cache)
   async function resetToApiArtwork(uri) {
     LocalArtwork.remove(uri);
 
-    // Stop mirror lokal
     playerNPV.destroy();
     playerSL.destroy();
+    playerAlbum.destroy();
+    playerMini.destroy();
+    playerRightPanel.destroy();
     sharedVideoLocal.destroy();
 
-    // Switch back to API source
     switchToVideo(sharedVideo);
 
     if (!sharedVideo.ready) {
-      // sharedVideo was never loaded for this track → reload from lastM3u8
+
       if (lastM3u8) {
         const loaded = await sharedVideo.load(lastM3u8);
         if (!loaded) { E("Reset: sharedVideo failed to reload"); return; }
@@ -1168,8 +1268,11 @@
       }
     }
 
-    tryInject(playerNPV, findNpv, "NPV (reset)");
-    tryInject(playerSL,  findSL,  "SL  (reset)");
+    tryInjectNpv("NPV (reset)");
+    tryInject(playerSL,         findSL,         "SL    (reset)");
+    tryInject(playerAlbum,      findAlbumPage,  "Album (reset)");
+    tryInject(playerMini,       findMiniPlayer, "Mini  (reset)");
+    tryInject(playerRightPanel, findRightPanel, "Right (reset)");
     L(`LocalArtwork: reset to API for ${uri}`);
   }
 
@@ -1179,27 +1282,74 @@
       const resp = await fetch(`${PROXY_BASE}/artwork?${params}`, { signal: AbortSignal.timeout(15000) });
       if (!resp.ok) { E(`/artwork error: ${resp.status}`); return null; }
       const json = await resp.json();
-      // json.source = "m8tec" | "apple" | null
       return json.m3u8 ? { m3u8: json.m3u8, source: json.source || null } : null;
     } catch (e) { E("fetchM3u8:", e.message); return null; }
   }
 
+  // Picks the first candidate element that actually has a plausible
+  // on-screen size, instead of just the first one that matches in the DOM.
+  // Root cause of the NPV bug: `.main-coverSlotExpanded-container` exists in
+  // the DOM at all times (even when unused, at 0×0), so a plain `||` chain
+  // would "find" it and never fall through to the real, correctly-sized
+  // `.MediaImageContainer` — confirmed via live debug (0×0 vs 494×494).
+  const firstVisible = (...getters) => {
+    for (const get of getters) {
+      let el;
+      try { el = get(); } catch (_) { el = null; }
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width > 20 && r.height > 20) return el;
+    }
+    return null;
+  };
+
   const findNpv = () =>
-    document.querySelector(".MediaImageContainer") ||
-    document.querySelector("[data-testid='cover-art-image']")?.closest("[data-testid='cover-art']") ||
-    document.querySelector("[data-testid='now-playing-widget'] [data-testid='cover-art']") ||
-    document.querySelector(".main-coverSlotExpanded-container") || null;
+    firstVisible(
+      () => document.querySelector(".MediaImageContainer"),
+      () => document.querySelector(".main-coverSlotExpanded-container"),
+      () => document.querySelector("[data-testid='cover-art-image']")?.closest("[data-testid='cover-art']"),
+    );
+
+  // Bottom-left mini player (the small thumbnail next to the track title in
+  // the playback bar). This used to share a finder with findNpv() above —
+  // since a finder can only ever return ONE element, whichever selector
+  // matched first "won" and the mini player never got its own video.
+  const findMiniPlayer = () =>
+    firstVisible(
+      () => document.querySelector("[data-testid='now-playing-widget'] [data-testid='cover-art']"),
+      () => document.querySelector(".main-nowPlayingBar-left [data-testid='cover-art']"),
+      () => document.querySelector(".main-nowPlayingWidget-coverArt"),
+    );
+
+  // Right-hand "Now Playing" sidebar panel (queue / about-the-artist panel).
+  const findRightPanel = () =>
+    firstVisible(
+      () => document.querySelector("[data-testid='NPV_Panel'] [data-testid='cover-art']"),
+      () => document.querySelector("[data-testid='right-sidebar'] [data-testid='cover-art']"),
+      () => document.querySelector(".main-nowPlayingView-coverArt"),
+      () => document.querySelector(".main-nowPlayingView-nowPlayingWidget [data-testid='cover-art']"),
+    );
 
   const findSL = () => {
+    // [class*='SpicyLyrics'] used to also match a persistent 1x1px
+    // ".SpicyLyricsFontPixel" helper span that exists on the page at all
+    // times (a font-loading trick), not the actual lyrics cover — which is
+    // why SL kept "succeeding" against a 1x1 target. Excluding *Pixel* class
+    // names and requiring a plausible on-screen size fixes that.
+    const isRealCandidate = (el) => {
+      if (!el || /pixel/i.test(el.className || "")) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 20 && r.height > 20;
+    };
+
     const root =
       document.querySelector("#SpicyLyricsPage") ||
       document.querySelector(".spicylyrics-page") ||
-      document.querySelector("[class*='SpicyLyrics']") ||
       document.querySelector("[data-spicylyrics]") ||
-      document.querySelector(".Root__fullscreen-page [class*='SpicyLyrics']") ||
       document.querySelector(".Root__fullscreen-page #SpicyLyricsPage") ||
-      document.querySelector("[class*='fullscreen'] [class*='SpicyLyrics']") ||
-      document.querySelector("[class*='fullscreen'] #SpicyLyricsPage");
+      document.querySelector("[class*='fullscreen'] #SpicyLyricsPage") ||
+      [...document.querySelectorAll("[class*='SpicyLyrics']")].find(isRealCandidate) ||
+      null;
     if (!root) return null;
     return (
       root.querySelector(".MediaImageContainer") ||
@@ -1211,7 +1361,34 @@
     );
   };
 
-  // tryInject: find container, then show mirror canvas (no re-transcoding)
+  // Album page (the big hero cover art shown at the top of an /album/<id> page).
+  // Only inject there when the album page currently open actually belongs to the
+  // track that's playing — otherwise the animated cover would show on whatever
+  // unrelated album the user happens to be browsing.
+  const currentAlbumId = () => {
+    const track    = Spicetify.Player.data?.item;
+    const albumUri = track?.metadata?.album_uri || track?.album?.uri || "";
+    const parts     = albumUri.split(":");
+    return parts.length === 3 ? parts[2] : null;
+  };
+
+  const findAlbumPage = () => {
+    const albumId = currentAlbumId();
+    if (albumId && !location.pathname.startsWith(`/album/${albumId}`)) return null;
+    // If we can't resolve an album id from the metadata, fall back to "any
+    // album page" rather than refusing to inject at all.
+    if (!albumId && !location.pathname.startsWith("/album/")) return null;
+
+    return firstVisible(
+      () => document.querySelector("[data-testid='entity-header'] [data-testid='cover-art']"),
+      () => document.querySelector("[data-testid='entity-header'] [data-testid='cover-art-image']")?.closest("[data-testid='cover-art']"),
+      () => document.querySelector("[data-testid='entityImage']"),
+      () => document.querySelector(".main-entityHeader-imageContainer"),
+      () => document.querySelector("[class*='entityHeader'][class*='mage']"),
+      () => document.querySelector(".main-entityHeader-image"),
+    );
+  };
+
   async function tryInject(player, finder, label, tries = 20) {
     if (player.isInjecting) return false;
     if (player.isActive())  return true;
@@ -1248,23 +1425,22 @@
     const title  = track.metadata?.title        || "";
     L(`▶ "${title}" — ${artist}`);
 
-    // Destroy mirror + kedua shared video lama
     playerNPV.destroy();
     playerSL.destroy();
+    playerAlbum.destroy();
+    playerMini.destroy();
+    playerRightPanel.destroy();
     sharedVideo.destroy();
     sharedVideoLocal.destroy();
     lastM3u8   = null;
     lastSource = null;
 
-    // Reset mirror pointer to API (default)
     switchToVideo(sharedVideo);
 
-    // Update local UI button (status reset per track)
     LocalUI._updatePanel?.();
 
     if (!artist && !title) return;
 
-    // ── Check if this track has a local override ──────────────
     const localEntry = LocalArtwork.get(uri);
     if (localEntry) {
       L(`LocalArtwork: found for ${uri} — skip API`);
@@ -1272,10 +1448,13 @@
       switchToVideo(sharedVideoLocal);
       const ok = await sharedVideoLocal.load(localEntry.blobUrl, localEntry.type);
       if (ok) {
-        tryInject(playerNPV, findNpv, "NPV (local)");
-        tryInject(playerSL,  findSL,  "SL  (local)");
+        tryInjectNpv("NPV (local)");
+        tryInject(playerSL,         findSL,         "SL    (local)");
+        tryInject(playerAlbum,      findAlbumPage,  "Album (local)");
+        tryInject(playerMini,       findMiniPlayer, "Mini  (local)");
+        tryInject(playerRightPanel, findRightPanel, "Right (local)");
       }
-      // Still fetch m3u8 in the background for future reset
+
       proxyOk = await isProxyAlive();
       if (proxyOk) {
         fetchM3u8(artist, album, title).then(result => {
@@ -1285,24 +1464,41 @@
       return;
     }
 
-    // ── Normal flow: API artwork ───────────────────────────────
     proxyOk = await isProxyAlive();
     if (!proxyOk) { E("Proxy not running! Start with: node animart-proxy.js"); return; }
 
     const result = await fetchM3u8(artist, album, title);
     if (!result) { L("No animated artwork for this track"); return; }
     lastM3u8   = result.m3u8;
-    lastSource = result.source;   // "m8tec" | "apple"
+    lastSource = result.source;
 
     const loaded = await sharedVideo.load(lastM3u8);
     if (!loaded) { E("SharedVideo failed to load"); return; }
 
-    tryInject(playerNPV, findNpv, "Now Bar");
-    tryInject(playerSL,  findSL,  "Spicy Lyrics");
+    tryInjectNpv("Now Bar");
+    tryInject(playerSL,         findSL,         "Spicy Lyrics");
+    tryInject(playerAlbum,      findAlbumPage,  "Album Page");
+    tryInject(playerMini,       findMiniPlayer, "Mini Player");
+    tryInject(playerRightPanel, findRightPanel, "Right Panel");
   }
 
   let observerTimer  = null;
   let lastFullscreen = !!document.fullscreenElement;
+
+  function isInFullscreen() {
+    return (
+      !!document.fullscreenElement ||
+      document.documentElement.classList.contains("fullscreen") ||
+      document.body.classList.contains("fullscreen") ||
+      !!document.querySelector(".Root__fullscreen-page") ||
+      !!document.querySelector("[class*='fullscreen-mode']")
+    );
+  }
+
+  function tryInjectNpv(label, tries) {
+    if (isInFullscreen()) { playerNPV.pause(); return; }
+    tryInject(playerNPV, findNpv, label, tries);
+  }
 
   function scheduleReInject(delay = 300) {
     clearTimeout(observerTimer);
@@ -1311,78 +1507,101 @@
       const activeSV = hasLocal ? sharedVideoLocal : sharedVideo;
       if (!activeSV.ready) return;
       if (!hasLocal && (!lastM3u8 || !proxyOk)) return;
-      if (!playerNPV.isActive() && !playerNPV.isInjecting)
-        tryInject(playerNPV, findNpv, "NPV (re)", 8);
+
+      if (isInFullscreen()) {
+        if (playerNPV.isPlaying && !playerNPV.isPaused) playerNPV.pause();
+      } else if (!playerNPV.isActive() && !playerNPV.isInjecting) {
+        tryInjectNpv("NPV (re)", 8);
+      }
       if (!playerSL.isActive() && !playerSL.isInjecting)
         tryInject(playerSL, findSL, "SL (re)", 8);
+      if (!playerAlbum.isActive() && !playerAlbum.isInjecting)
+        tryInject(playerAlbum, findAlbumPage, "Album (re)", 8);
+      if (!playerMini.isActive() && !playerMini.isInjecting)
+        tryInject(playerMini, findMiniPlayer, "Mini (re)", 8);
+      if (!playerRightPanel.isActive() && !playerRightPanel.isInjecting)
+        tryInject(playerRightPanel, findRightPanel, "Right (re)", 8);
     }, delay);
   }
 
-  // Mount global outside-click listener ONCE
   LocalUI.initOutsideListener();
+  LocalUI._startThemeWatcher();
 
-  // ── LocalUI mount polling ──────────────────────────────────
-  // Spicy Lyrics DOM can appear at any time → try mounting button every 500ms
-  // (faster than 2000ms so the button appears promptly when Spicy Lyrics opens)
   setInterval(() => LocalUI.tryMount(), 500);
-  // Try a few times immediately at startup
+
   setTimeout(() => LocalUI.tryMount(), 300);
   setTimeout(() => LocalUI.tryMount(), 1000);
   setTimeout(() => LocalUI.tryMount(), 2500);
 
-  // Native fullscreen API
   document.addEventListener("fullscreenchange", () => {
     const isFs = !!document.fullscreenElement;
     if (isFs !== lastFullscreen) {
       lastFullscreen = isFs;
       L(`Fullscreen ${isFs ? "entered" : "exited"} — re-injecting`);
-      playerNPV.destroy();
-      playerSL.destroy();
-      // shorter delay: new canvas appears immediately without waiting long
+      if (isFs) {
+
+        playerNPV.pause();
+        playerSL.destroy();
+      } else {
+        playerNPV.destroy();
+        playerSL.destroy();
+      }
+
       scheduleReInject(150);
     }
   });
 
-  // Spicetify CSS-based fullscreen detection
   const fsObserver = new MutationObserver(() => {
-    const isFs =
-      document.documentElement.classList.contains("fullscreen") ||
-      document.body.classList.contains("fullscreen") ||
-      !!document.querySelector(".Root__fullscreen-page") ||
-      !!document.querySelector("[class*='fullscreen-mode']");
+    const isFs = isInFullscreen();
     if (isFs !== lastFullscreen) {
       lastFullscreen = isFs;
       L(`Spicetify fullscreen ${isFs ? "entered" : "exited"} — re-injecting`);
-      playerNPV.destroy();
-      playerSL.destroy();
+      if (isFs) {
+        playerNPV.pause();
+        playerSL.destroy();
+      } else {
+        playerNPV.destroy();
+        playerSL.destroy();
+      }
       scheduleReInject(150);
     }
   });
   fsObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
   fsObserver.observe(document.body,            { attributes: true, attributeFilter: ["class"] });
 
-  // DOM observer — only watch for removed animart canvases.
-  // Debounced: the callback fires at most once per 200ms to avoid
-  // hammering the main thread during Spicy Lyrics lyric scrolling.
-  let _obsTimer = null;
-  const observer = new MutationObserver((mutations) => {
-    if (!lastM3u8 || !proxyOk) return;
-    const canvasRemoved = mutations.some(m => {
-      for (const node of m.removedNodes) {
-        if (node.id === "animart-npv-canvas" || node.id === "animart-sl-canvas") return true;
-        if (node.querySelector?.("#animart-npv-canvas, #animart-sl-canvas")) return true;
-      }
-      return false;
-    });
-    if (!canvasRemoved) return;
-    // Debounce re-inject to avoid triggering on every lyric update frame
-    clearTimeout(_obsTimer);
-    _obsTimer = setTimeout(() => scheduleReInject(100), 200);
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
+  setInterval(() => {
+    if (!lastM3u8 && !(currentUri && LocalArtwork.has(currentUri))) return;
+    const npvGone   = playerNPV.isPlaying   && !playerNPV.isActive()   && !playerNPV.isInjecting;
+    const slGone    = playerSL.isPlaying    && !playerSL.isActive()    && !playerSL.isInjecting;
+    const albumGone = playerAlbum.isPlaying && !playerAlbum.isActive() && !playerAlbum.isInjecting;
+    const miniGone  = playerMini.isPlaying       && !playerMini.isActive()       && !playerMini.isInjecting;
+    const rightGone = playerRightPanel.isPlaying && !playerRightPanel.isActive() && !playerRightPanel.isInjecting;
+    if (npvGone || slGone || albumGone || miniGone || rightGone) scheduleReInject(50);
+  }, 250);
 
-  // Mount LocalUI on DOM changes (Spicy Lyrics may have just appeared).
-  // Use subtree:false + childList only to avoid firing on every lyric node change.
+  // The album hero cover only exists in the DOM once the user *navigates* to
+  // an album page — there's no songchange/fullscreen event for that, so poll
+  // for it directly (same pattern already used for LocalUI.tryMount below).
+  // Uses playerAlbum.show() directly (not the tryInject helper) so a page
+  // that simply isn't an album page doesn't spam "container not found" logs.
+  setInterval(() => {
+    if (!lastM3u8 && !(currentUri && LocalArtwork.has(currentUri))) return;
+    if (!location.pathname.startsWith("/album/")) return;
+    if (playerAlbum.isActive() || playerAlbum.isInjecting) return;
+    const el = findAlbumPage();
+    if (el) playerAlbum.show(el).then(ok => { if (ok) { L("✓ Album (poll)"); MirrorManager.update(); } });
+  }, 1000);
+
+  // Same reasoning as the album poll above: the right-hand Now Playing panel
+  // can be toggled open/closed by the user at any time, independent of song
+  // changes, so it needs its own quiet poll too.
+  setInterval(() => {
+    if (!lastM3u8 && !(currentUri && LocalArtwork.has(currentUri))) return;
+    if (playerRightPanel.isActive() || playerRightPanel.isInjecting) return;
+    const el = findRightPanel();
+    if (el) playerRightPanel.show(el).then(ok => { if (ok) { L("✓ Right (poll)"); MirrorManager.update(); } });
+  }, 1000);
+
   let _uiTimer = null;
   const uiObserver = new MutationObserver(() => {
     clearTimeout(_uiTimer);
@@ -1390,9 +1609,30 @@
   });
   uiObserver.observe(document.body, { childList: true, subtree: false });
 
-  // ── FIX 1: Periodic MirrorManager polling ─────────────────
-  // Without this, pause/resume never fires → both draw loops run simultaneously
-  setInterval(() => MirrorManager.update(), 800);  // reduced polling frequency to ease main thread
+  setInterval(() => MirrorManager.update(), 800);
+
+  // Debug helper — run window.__animartDebug() in the DevTools console to
+  // see exactly which element each target matched, its on-screen size, and
+  // its class/data-testid. Paste that output back if a target still looks
+  // wrong; guessing selectors blind isn't reliable past this point.
+  window.__animartDebug = () => {
+    const targets = {
+      npv:   typeof findNpv        === "function" ? findNpv()        : null,
+      sl:    typeof findSL         === "function" ? findSL()         : null,
+      album: typeof findAlbumPage  === "function" ? findAlbumPage()  : null,
+      mini:  typeof findMiniPlayer === "function" ? findMiniPlayer() : null,
+      right: typeof findRightPanel === "function" ? findRightPanel() : null,
+    };
+    for (const [name, el] of Object.entries(targets)) {
+      if (!el) { console.log(`[AnimArt debug] ${name}: NOT FOUND`); continue; }
+      const r = el.getBoundingClientRect();
+      console.log(
+        `[AnimArt debug] ${name}: ${Math.round(r.width)}x${Math.round(r.height)}px`,
+        `class="${el.className}"`, `testid="${el.dataset?.testid || ""}"`,
+        el
+      );
+    }
+  };
 
   L("v2 — single transcode + multi-canvas mirror + rVFC + rAF fallback + VP9");
   proxyOk = await isProxyAlive();
